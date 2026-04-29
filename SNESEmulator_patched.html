@@ -1,0 +1,3185 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>D!ng — SNES Emulator</title>
+  <script src="https://unpkg.com/react@18/umd/react.development.js"></script>
+  <script src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { background: #0a0a0c; }
+    #root { min-height: 100vh; }
+  </style>
+</head>
+<body>
+  <div id="root"></div>
+  <script type="text/babel">
+    const { useState, useEffect, useRef, useCallback } = React;
+
+
+const W = 256, H = 224, SCALE = 2;
+const SCANLINES = 262, DOTS_PER_LINE = 341;
+// NTSC master clock = 21.477272 MHz; 1 scanline = 1364 master clocks.
+// Fast-ROM CPU cycle = 6 master clocks; Slow-ROM = 8.
+// HBlank starts at master-clock 1096 within the scanline (≈ dot 274).
+const LINE_MC = 1364, HBLANK_MC = 1096;
+
+// SNES 16-bit joypad register layout (as read from $4218/$4219):
+//   $4219 (JOY1H): B=bit7  Y=bit6  Sel=bit5  Start=bit4  Up=bit3  Down=bit2  L=bit1  R=bit0
+//   $4218 (JOY1L): A=bit7  X=bit6  L=bit5    R=bit4      0=bits3-0
+// As a combined 16-bit word  →  B=15 Y=14 Sel=13 Start=12 Up=11 Down=10 Left=9 Right=8 A=7 X=6 L=5 R=4
+const KEY_MAP = {
+  z:15, Z:15,      // B
+  a:14, A:14,      // Y
+  Shift:13,        // Select
+  Enter:12,        // Start
+  ArrowUp:11, ArrowDown:10, ArrowLeft:9, ArrowRight:8,
+  x:7,  X:7,       // A
+  s:6,  S:6,       // X
+  q:5,  Q:5,       // L
+  w:4,  W:4,       // R
+};
+
+const KEYS_DISPLAY = [
+  { action:"B",      chips:["Z"] },
+  { action:"Y",      chips:["A"] },
+  { action:"A",      chips:["X"] },
+  { action:"X",      chips:["S"] },
+  { action:"L",      chips:["Q"] },
+  { action:"R",      chips:["W"] },
+  { action:"Select", chips:["Shift"] },
+  { action:"Start",  chips:["Enter"] },
+  { action:"D-Pad",  chips:["↑","↓","←","→"] },
+];
+
+// ── CARTRIDGE ────────────────────────────────────────────────────────────────
+// Supports LoROM, HiROM, ExHiROM (map mode $25). Recognises SA-1 / SDD-1 but
+// maps them as plain HiROM for now — they'll need co-proc stubs later.
+class Cartridge {
+  constructor(data) {
+    // Strip 512-byte copier header when present (size mod 1024 == 512)
+    const hasHeader = (data.length & 0x3FF) === 0x200;
+    this.rom = new Uint8Array(hasHeader ? data.slice(0x200) : data);
+
+    // Score all three candidate header locations
+    const loScore  = this._headerScore(0x7FC0);   // LoROM
+    const hiScore  = this._headerScore(0xFFC0);   // HiROM
+    const exScore  = this._headerScore(0x40FFC0); // ExHiROM (>32 Mbit)
+
+    const best = Math.max(loScore, hiScore, exScore);
+    this.exHiROM = (exScore === best && exScore > 0);
+    this.hiROM   = !this.exHiROM && (hiScore >= loScore);
+
+    const base = this.exHiROM ? 0x40FFC0 : this.hiROM ? 0xFFC0 : 0x7FC0;
+
+    this.title    = String.fromCharCode(...this.rom.slice(base, base+21))
+                      .replace(/[^\x20-\x7E]/g,'').trim() || 'Unknown ROM';
+    this.mapMode  = this.rom[base+0x15];
+    this.cartType = this.rom[base+0x16];
+    this.romSize  = this.rom[base+0x17];
+    this.ramSize  = this.rom[base+0x18];
+    this.country  = this.rom[base+0x19];
+    this.devId    = this.rom[base+0x1A];
+    this.version  = this.rom[base+0x1B];
+
+    // Human-readable mapper label
+    this.mapLabel = this.exHiROM ? 'ExHiROM'
+                  : this.hiROM   ? 'HiROM'
+                  :                'LoROM';
+
+    // Detect co-processors by cartType upper nibble
+    const chipUpper = (this.cartType >> 4) & 0xF;
+    if (chipUpper === 0x1 && this.devId === 0x33) this.mapLabel += '+SA-1';
+    if (chipUpper === 0x4)                         this.mapLabel += '+SDD-1';
+    if (chipUpper === 0x2)                         this.mapLabel += '+DSP';
+
+    // SRAM — clamp to power-of-2 KB; min 0, max 512 KB
+    const sramKB = this.ramSize > 0 ? Math.min(1 << this.ramSize, 512) : 0;
+    this.sram = new Uint8Array(sramKB * 1024);
+  }
+
+  // Score a candidate header at a ROM file offset.
+  // Higher is more likely to be the real header.
+  _headerScore(offset) {
+    if (offset + 0x40 > this.rom.length) return -100;
+    let score = 0;
+
+    // Checksum complement XOR checksum must equal 0xFFFF — strongest signal
+    const comp = (this.rom[offset+0x1D]<<8) | this.rom[offset+0x1C];
+    const csum = (this.rom[offset+0x1F]<<8) | this.rom[offset+0x1E];
+    if ((comp ^ csum) === 0xFFFF) score += 6;
+
+    // Map mode byte should be a known value
+    const mm = this.rom[offset+0x15];
+    if ([0x20,0x21,0x22,0x23,0x25,0x30,0x31,0x35,0x3A].includes(mm)) score += 3;
+
+    // Reset vector should point into ROM space
+    const reset = (this.rom[offset+0x3D]<<8) | this.rom[offset+0x3C];
+    if (reset >= 0x8000) score += 2;
+
+    // ROM size byte should be plausible (64KB–64MB = codes 6–12)
+    const sz = this.rom[offset+0x17];
+    if (sz >= 6 && sz <= 12) score += 1;
+
+    // Most title characters should be printable ASCII or null padding
+    let printable = 0;
+    for (let i = 0; i < 21; i++) {
+      const c = this.rom[offset+i];
+      if ((c >= 0x20 && c <= 0x7E) || c === 0x00) printable++;
+    }
+    if (printable >= 15) score += 2;
+
+    return score;
+  }
+
+  // Read one byte via 24-bit SNES address (bank + addr)
+  read(bank, addr) {
+    const b = bank & 0xFF, a = addr & 0xFFFF;
+
+    // ── ExHiROM ────────────────────────────────────────────────────────────
+    if (this.exHiROM) {
+      // Upper half: banks $40-$7D / $C0-$FF → straight 64KB pages
+      if ((b >= 0x40 && b <= 0x7D) || b >= 0xC0)
+        return this.rom[((b & 0x3F) * 0x10000 + a) % this.rom.length] ?? 0;
+      // Lower half: banks $00-$3F / $80-$BF, upper 32KB
+      if (a >= 0x8000) {
+        const offset = 0x200000 + ((b & 0x3F) * 0x8000) + (a - 0x8000);
+        return this.rom[offset % this.rom.length] ?? 0;
+      }
+      // HiROM SRAM: $20-$3F / $A0-$BF : $6000-$7FFF
+      if (this.sram.length > 0 && a >= 0x6000 && a <= 0x7FFF) {
+        const off = ((b & 0x1F) * 0x2000) + (a - 0x6000);
+        return this.sram[off % this.sram.length];
+      }
+      return 0;
+    }
+
+    // ── HiROM ──────────────────────────────────────────────────────────────
+    if (this.hiROM) {
+      // Full 64KB ROM banks
+      if ((b >= 0x40 && b <= 0x7D) || (b >= 0xC0 && b <= 0xFF))
+        return this.rom[((b & 0x3F) * 0x10000 + a) % this.rom.length] ?? 0;
+      // Mirrored upper 32KB in system area
+      if (a >= 0x8000)
+        return this.rom[((b & 0x3F) * 0x10000 + a) % this.rom.length] ?? 0;
+      // SRAM: $20-$3F / $A0-$BF : $6000-$7FFF
+      if (this.sram.length > 0 && a >= 0x6000 && a <= 0x7FFF) {
+        const bankIdx = b >= 0xA0 ? b - 0xA0 : b - 0x20;
+        const off = (bankIdx * 0x2000) + (a - 0x6000);
+        return this.sram[off % this.sram.length];
+      }
+      return 0;
+    }
+
+    // ── LoROM ──────────────────────────────────────────────────────────────
+    if (a >= 0x8000) {
+      const off = ((b & 0x7F) * 0x8000) + (a - 0x8000);
+      return this.rom[off % this.rom.length] ?? 0;
+    }
+    // SRAM: $70-$7D (and mirror $F0-$FF) : $0000-$7FFF
+    if (this.sram.length > 0 && ((b >= 0x70 && b <= 0x7D) || (b >= 0xF0 && b <= 0xFF))) {
+      const bankBase = b >= 0xF0 ? b - 0xF0 : b - 0x70;
+      const off = (bankBase * 0x8000) + a;
+      return this.sram[off % this.sram.length];
+    }
+    return 0;
+  }
+
+  write(bank, addr, val) {
+    const b = bank & 0xFF, a = addr & 0xFFFF;
+    if (!this.sram.length) return;
+
+    if (this.hiROM || this.exHiROM) {
+      if (a >= 0x6000 && a <= 0x7FFF) {
+        const bankIdx = b >= 0xA0 ? b - 0xA0 : b >= 0x20 ? b - 0x20 : 0;
+        const off = (bankIdx * 0x2000) + (a - 0x6000);
+        if (off < this.sram.length) this.sram[off] = val;
+      }
+    } else {
+      if ((b >= 0x70 && b <= 0x7D) || (b >= 0xF0 && b <= 0xFF)) {
+        const bankBase = b >= 0xF0 ? b - 0xF0 : b - 0x70;
+        const off = (bankBase * 0x8000) + a;
+        if (off < this.sram.length) this.sram[off] = val;
+      }
+    }
+  }
+}
+
+// ── BUS ──────────────────────────────────────────────────────────────────────
+// Full 24-bit address decoder.
+// $00-$3F / $80-$BF  → system area (WRAM mirror, PPU, APU, CPU I/O, cart)
+// $40-$7D / $C0-$FF  → cartridge ROM/SRAM
+// $7E-$7F            → WRAM (128 KB)
+class Bus {
+  constructor(cart) {
+    this.cart   = cart;
+    this.wram   = new Uint8Array(0x20000); // 128 KB
+    this.ppu    = null;  // wired after PPU is created
+    this.cpu    = null;  // wired for NMI/IRQ signalling
+
+    // Joypad auto-read results (written by SNES hardware each frame)
+    this.joypad = [0, 0];
+
+    // ── Internal CPU registers ($4200–$421F) ──────────────────────────────
+    this.nmitimen  = 0x00;  // $4200: NMI/IRQ/auto-joypad enable
+    this.wrio      = 0xFF;  // $4201: programmable I/O
+    this.memsel    = 0x00;  // $420D: ROM speed select
+
+    // NMI / IRQ flags (set by PPU timing, cleared on read)
+    this.nmiFlag   = 0x00;  // $4210 bit 7: vblank NMI pending
+    this.irqFlag   = 0x00;  // $4211 bit 7: H/V timer IRQ pending
+
+    // Hardware multiply ($4202/$4203 → $4216/$4217)
+    this.wrmpya    = 0xFF;
+    this.wrmpyb    = 0xFF;
+    this.mpyResult = 0x0000;
+
+    // Hardware divide ($4204-$4206 → $4214/$4215)
+    this.wrdivl    = 0xFF;
+    this.wrdivh    = 0xFF;
+    this.wrdivb    = 0xFF;
+    this.divResult = 0x0000;
+    this.modResult = 0x0000;
+
+    // H/V timer ($4207-$420A)
+    this.htime     = 0x01FF;
+    this.vtime     = 0x01FF;
+
+    // WRAM port ($2180–$2183)
+    this.wmaddr    = 0;      // 17-bit WRAM address
+
+    // DMA channels (8 × general-purpose)
+    this.mdmaen    = 0;
+    this.hdmaen    = 0;
+    this.dmaChannels = Array.from({length:8}, () => ({
+      ctrl:0, destReg:0, srcAddr:0, srcBank:0,
+      size:0, tableAddr:0, tableBank:0, lineCounter:0,
+      indirectAddr:0, hdmaFinished:false,
+    }));
+
+    // APU I/O ports $2140–$2143 — wired to real SPC700 instance.
+    // bus.spc is set by SNES constructor after creating both objects.
+    // apuOut/apuIn are kept as aliases to spc.outPorts/inPorts for diagSnap.
+    this.spc    = null;   // set by SNES constructor
+    this.apuOut = new Uint8Array(4); // alias updated each frame by SNES
+    this.apuIn  = new Uint8Array(4);
+    // Ring buffer of last 128 APU port accesses for diagnostics
+    this.apuLog   = [];
+    this._apuLogMax = 128;
+
+    // Open-bus: last value put on the data bus (returned for unmapped reads)
+    this.openBus = 0;
+
+    // Serial joypad latch ($4016 write strobe, $4016/$4017 serial reads)
+    this._joyStrobe = false;
+    this._joyBit1   = 0;   // serial bit counter for controller 1
+    this._joyBit2   = 0;   // serial bit counter for controller 2
+  }
+
+  // ── Main read entry-point ─────────────────────────────────────────────────
+  read(addr24) {
+    const bank = (addr24 >> 16) & 0xFF;
+    const addr =  addr24        & 0xFFFF;
+    const b    = bank & 0x7F;   // mirror mask ($80–$BF mirrors $00–$3F)
+
+    let v;
+
+    // WRAM banks
+    if (bank === 0x7E || bank === 0x7F) {
+      v = this.wram[((bank - 0x7E) << 16) | addr];
+    }
+    // System area (banks $00–$3F and mirrors $80–$BF)
+    else if (b <= 0x3F) {
+      if      (addr <= 0x1FFF)               v = this.wram[addr & 0x1FFF];
+      else if (addr <= 0x20FF)               v = this.openBus;        // unused
+      else if (addr <= 0x213F)               v = this.ppu?.regRead(addr) ?? this.openBus;
+      else if (addr <= 0x2143) {
+        const n = addr - 0x2140;
+        // If the 65816 is spinning on this port (same value as last read),
+        // burst-run the SPC until the port changes or 512 SPC cycles pass.
+        // This replicates true parallel execution — on real hardware the SPC
+        // keeps running the whole time the 65816 is in a wait loop.
+        if (this.spc) {
+          const last = this.apuLog[this.apuLog.length-1];
+          if (last && last.dir==='R' && last.port===n) {
+            const before = this.spc.outPorts[n];
+            for (let i=0; i<512 && this.spc.outPorts[n]===before; i++) {
+              this.spc.step();
+            }
+          }
+        }
+        const v2 = this.spc ? this.spc.outPorts[n] : 0;
+        // Only log a read if it differs from the last entry (avoids flooding from tight CMP loops)
+        const last = this.apuLog[this.apuLog.length-1];
+        if (!last || last.dir!=='R' || last.port!==n || last.val!==v2 || last.a!==(this.cpu?.A??0)) {
+          this.apuLog.push({dir:'R',port:n,val:v2,a:this.cpu?.A??0,rep:1});
+          if (this.apuLog.length > this._apuLogMax) this.apuLog.shift();
+        } else {
+          last.rep = (last.rep||1) + 1;
+        }
+        v = v2;
+      }
+      else if (addr === 0x2180)              v = this._wramPortRead();
+      else if (addr <= 0x21FF)               v = this.openBus;
+      else if (addr >= 0x2200 && addr <= 0x3FFF) v = this.openBus;   // expansion
+      // $4016 / $4017 — serial joypad data (bit 0 = controller data line)
+      // Bit order out: B Y Select Start Up Down Left Right A X L R 1 1 1 1
+      else if (addr === 0x4016) {
+        if (this._joyStrobe) { v = 1; }
+        else { const bit = this._joyBit1; this._joyBit1 = Math.min(bit+1,16); v = bit >= 16 ? 1 : (this.joypad[0] >> (15-bit)) & 1; }
+      }
+      else if (addr === 0x4017) {
+        if (this._joyStrobe) { v = 1; }
+        else { const bit = this._joyBit2; this._joyBit2 = Math.min(bit+1,16); v = bit >= 16 ? 1 : (this.joypad[1] >> (15-bit)) & 1; }
+      }
+      // $4000-$41FF — rest is open bus (covers old $4000-$40FF and fills $4100-$41FF gap that was falling to cart)
+      else if (addr >= 0x4000 && addr <= 0x41FF) v = this.openBus;
+      else if (addr >= 0x4200 && addr <= 0x44FF) v = this._ri(addr);
+      // $4500-$5FFF — unmapped in system area, return open bus rather than cart data
+      else if (addr >= 0x4500 && addr <= 0x5FFF) v = this.openBus;
+      else                                    v = this.cart.read(bank, addr);
+    }
+    // Cartridge area (banks $40–$7D / $C0–$FF)
+    else {
+      v = this.cart.read(bank, addr);
+    }
+
+    this.openBus = v & 0xFF;
+    return this.openBus;
+  }
+
+  // ── Main write entry-point ────────────────────────────────────────────────
+  write(addr24, val) {
+    const bank = (addr24 >> 16) & 0xFF;
+    const addr =  addr24        & 0xFFFF;
+    const b    = bank & 0x7F;
+    val &= 0xFF;
+
+    if (bank === 0x7E || bank === 0x7F) {
+      this.wram[((bank - 0x7E) << 16) | addr] = val; return;
+    }
+    if (b <= 0x3F) {
+      if      (addr <= 0x1FFF)  { this.wram[addr & 0x1FFF] = val; return; }
+      else if (addr <= 0x213F)  { this.ppu?.regWrite(addr, val); return; }
+      else if (addr === 0x2180) { this._wramPortWrite(val); return; }
+      else if (addr === 0x2181) { this.wmaddr = (this.wmaddr & 0x1FF00) | val; return; }
+      else if (addr === 0x2182) { this.wmaddr = (this.wmaddr & 0x100FF) | (val << 8); return; }
+      else if (addr === 0x2183) { this.wmaddr = (this.wmaddr & 0x0FFFF) | ((val & 1) << 16); return; }
+      else if (addr >= 0x2140 && addr <= 0x2143) {
+        const n = addr - 0x2140;
+        this.apuIn[n] = val;
+        if (this.spc) this.spc.inPorts[n] = val;
+        this.apuLog.push({dir:'W',port:n,val,a:this.cpu?.A??0});
+        if (this.apuLog.length > this._apuLogMax) this.apuLog.shift();
+        return;
+      }
+      else if (addr >= 0x2144 && addr <= 0x217F) return;  // APU I/O (upper, ignored)
+      else if (addr === 0x4016) {
+        // Joypad strobe: writing bit 0 = 1 holds latch (returns 1), writing 0 releases for serial read
+        if (val & 1) { this._joyStrobe = true;  this._joyBit1 = 0; this._joyBit2 = 0; }
+        else         { this._joyStrobe = false; }
+        return;
+      }
+      else if (addr >= 0x4200 && addr <= 0x44FF) { this._wi(addr, val); return; }
+      else { this.cart.write(bank, addr, val); return; }
+    }
+    this.cart.write(bank, addr, val);
+  }
+
+  // ── WRAM port ($2180) ─────────────────────────────────────────────────────
+  _wramPortRead() {
+    const v = this.wram[this.wmaddr & 0x1FFFF];
+    this.wmaddr = (this.wmaddr + 1) & 0x1FFFF;
+    return v;
+  }
+  _wramPortWrite(val) {
+    this.wram[this.wmaddr & 0x1FFFF] = val;
+    this.wmaddr = (this.wmaddr + 1) & 0x1FFFF;
+  }
+
+  // ── Internal register reads ($4200–$44FF) ─────────────────────────────────
+  _ri(addr) {
+    switch (addr) {
+      case 0x4210: { // RDNMI — vblank NMI flag (cleared on read, bit 7)
+        const v = this.nmiFlag | 0x02; // CPU version bits
+        this.nmiFlag = 0;
+        return v;
+      }
+      case 0x4211: { // TIMEUP — H/V IRQ flag (cleared on read)
+        const v = this.irqFlag;
+        this.irqFlag = 0;
+        return v;
+      }
+      case 0x4212: { // HVBJOY — H/V blank + auto-joypad busy
+        const vbl = this.ppu?.vblank ? 0x80 : 0;
+        const hbl = this.ppu?.hblank ? 0x40 : 0;
+        return vbl | hbl | 0x01; // bit 0: auto-joypad always ready
+      }
+      case 0x4213: return this.wrio;
+      case 0x4214: return  this.divResult        & 0xFF;
+      case 0x4215: return (this.divResult >> 8)  & 0xFF;
+      case 0x4216: return  this.mpyResult        & 0xFF;
+      case 0x4217: return (this.mpyResult >> 8)  & 0xFF;
+      case 0x4218: return  this.joypad[0]        & 0xFF;  // JOY1L
+      case 0x4219: return (this.joypad[0] >> 8)  & 0xFF;  // JOY1H
+      case 0x421A: return  this.joypad[1]        & 0xFF;  // JOY2L
+      case 0x421B: return (this.joypad[1] >> 8)  & 0xFF;  // JOY2H
+      case 0x421C: case 0x421D: case 0x421E: case 0x421F: return 0; // JOY3/4
+      default: {
+        // DMA channel registers $4300–$437F
+        if (addr >= 0x4300 && addr <= 0x437F) {
+          const ch = (addr >> 4) & 7, reg = addr & 0xF, c = this.dmaChannels[ch];
+          if (reg === 0) return c.ctrl;
+          if (reg === 1) return c.destReg;
+          if (reg === 2) return  c.srcAddr       & 0xFF;
+          if (reg === 3) return (c.srcAddr >> 8)  & 0xFF;
+          if (reg === 4) return  c.srcBank;
+          if (reg === 5) return  c.size           & 0xFF;
+          if (reg === 6) return (c.size >> 8)     & 0xFF;
+          if (reg === 7) return  c.tableAddr      & 0xFF;
+          if (reg === 8) return (c.tableAddr >> 8) & 0xFF;
+          if (reg === 9) return  c.tableBank;
+          if (reg === 0xA) return c.lineCounter;
+        }
+        return this.openBus;
+      }
+    }
+  }
+
+  // ── Internal register writes ($4200–$44FF) ────────────────────────────────
+  _wi(addr, val) {
+    switch (addr) {
+      case 0x4200: this.nmitimen = val; return;
+      case 0x4201: this.wrio     = val; return;
+
+      // Hardware multiply: write multiplier bytes, result ready after $4203
+      case 0x4202: this.wrmpya = val; return;
+      case 0x4203:
+        this.wrmpyb    = val;
+        this.mpyResult = (this.wrmpya * this.wrmpyb) & 0xFFFF;
+        // divide result is clobbered with remainder
+        this.divResult = this.wrmpyb;
+        return;
+
+      // Hardware divide: write dividend (2 bytes) + divisor, result after $4206
+      case 0x4204: this.wrdivl = val; return;
+      case 0x4205: this.wrdivh = val; return;
+      case 0x4206: {
+        this.wrdivb = val;
+        const dividend = (this.wrdivh << 8) | this.wrdivl;
+        if (val === 0) {
+          this.divResult = 0xFFFF;
+          this.modResult = dividend;
+        } else {
+          this.divResult = (dividend / val) >>> 0;
+          this.modResult = dividend % val;
+        }
+        this.mpyResult = this.modResult; // remainder goes into multiply result
+        return;
+      }
+
+      // H/V timer targets
+      case 0x4207: this.htime = (this.htime & 0x100) | val; return;
+      case 0x4208: this.htime = (this.htime & 0x0FF) | ((val & 1) << 8); return;
+      case 0x4209: this.vtime = (this.vtime & 0x100) | val; return;
+      case 0x420A: this.vtime = (this.vtime & 0x0FF) | ((val & 1) << 8); return;
+
+      case 0x420B: this.mdmaen = val; this._runDMA(); return;
+      case 0x420C: this.hdmaen = val; return;
+      case 0x420D: this.memsel = val; return;
+
+      default: {
+        // DMA channel registers $4300–$437F
+        if (addr >= 0x4300 && addr <= 0x437F) {
+          const ch = (addr >> 4) & 7, reg = addr & 0xF, c = this.dmaChannels[ch];
+          if (reg === 0) c.ctrl      = val;
+          if (reg === 1) c.destReg   = val;
+          if (reg === 2) c.srcAddr   = (c.srcAddr   & 0xFF00) | val;
+          if (reg === 3) c.srcAddr   = (c.srcAddr   & 0x00FF) | (val << 8);
+          if (reg === 4) c.srcBank   = val;
+          if (reg === 5) c.size      = (c.size      & 0xFF00) | val;
+          if (reg === 6) c.size      = (c.size      & 0x00FF) | (val << 8);
+          if (reg === 7) c.tableAddr = (c.tableAddr & 0xFF00) | val;
+          if (reg === 8) c.tableAddr = (c.tableAddr & 0x00FF) | (val << 8);
+          if (reg === 9) c.tableBank = val;
+          if (reg === 0xA) c.lineCounter = val;
+        }
+      }
+    }
+  }
+
+  // ── DMA execution ($420B write triggers this) ─────────────────────────────
+  // Supports transfer patterns 0–7 (single/double/alternating PPU register writes)
+  _runDMA() {
+    // Transfer pattern → list of PPU register offsets to write in sequence
+    const PATTERNS = [
+      [0],         // 0: 1 reg, 1 byte   (e.g. VMDATAL)
+      [0, 1],      // 1: 2 regs, 2 bytes (e.g. VMDATAL+VMDATAH)
+      [0, 0],      // 2: 1 reg, 2 bytes  (write same reg twice)
+      [0, 0, 1, 1],// 3: 2 regs, 4 bytes
+      [0, 1, 2, 3],// 4: 4 regs, 4 bytes
+      [0, 1],      // 5: same as 1 for simplicity
+      [0, 0],      // 6: same as 2
+      [0, 0, 1, 1],// 7: same as 3
+    ];
+
+    for (let ch = 0; ch < 8; ch++) {
+      if (!(this.mdmaen & (1 << ch))) continue;
+      const c       = this.dmaChannels[ch];
+      const pattern = PATTERNS[c.ctrl & 0x7];
+      const toWRAM  = !!(c.ctrl & 0x80); // direction: 0=CPU→PPU, 1=PPU→CPU
+      const fixed   = !!(c.ctrl & 0x08); // fixed source address
+      const decr    = !!(c.ctrl & 0x10); // decrement source
+
+      let src   = (c.srcBank << 16) | c.srcAddr;
+      let count = c.size === 0 ? 0x10000 : c.size;
+      let pi    = 0; // pattern index
+
+      while (count-- > 0) {
+        const destAddr = 0x2100 | c.destReg | pattern[pi % pattern.length];
+        pi++;
+        if (toWRAM) {
+          // PPU → WRAM direction (rare, e.g. VRAM read-back)
+          this.write(src, this.read(destAddr));
+        } else {
+          this.write(destAddr, this.read(src));
+        }
+        if (!fixed) {
+          if (decr) src = (src & 0xFF0000) | ((src - 1) & 0xFFFF);
+          else      src = (src & 0xFF0000) | ((src + 1) & 0xFFFF);
+        }
+      }
+    }
+    this.mdmaen = 0;
+  }
+
+  // Called by PPU at start of VBlank to raise NMI if enabled
+  triggerNMI() {
+    this.nmiFlag = 0x80;
+    if (this.nmitimen & 0x80) { if (this.cpu) this.cpu.pendingNMI = true; }
+  }
+
+  // ── HDMA init — called once per frame at scanline 0 ──────────────────────
+  // Copies srcAddr → tableAddr, loads the first lineCounter byte for each
+  // enabled channel. Indirect channels also pre-fetch the data pointer.
+  hdmaInit() {
+    const PATTERN_LEN = [1,2,2,4,4,4,2,4]; // bytes transferred per pattern
+    for (let ch = 0; ch < 8; ch++) {
+      if (!(this.hdmaen & (1 << ch))) continue;
+      const c = this.dmaChannels[ch];
+      c.tableAddr    = c.srcAddr;
+      c.tableBank    = c.srcBank;
+      c.hdmaFinished = false;
+      // Load first line-count byte
+      c.lineCounter = this.read((c.tableBank << 16) | c.tableAddr);
+      c.tableAddr   = (c.tableAddr + 1) & 0xFFFF;
+      if (c.lineCounter === 0) { c.hdmaFinished = true; continue; }
+      // Indirect mode: fetch the 16-bit data pointer
+      if (c.ctrl & 0x40) {
+        const lo = this.read((c.tableBank << 16) | c.tableAddr);
+        c.tableAddr = (c.tableAddr + 1) & 0xFFFF;
+        const hi = this.read((c.tableBank << 16) | c.tableAddr);
+        c.tableAddr = (c.tableAddr + 1) & 0xFFFF;
+        c.indirectAddr = (hi << 8) | lo;
+      }
+    }
+    void PATTERN_LEN; // used below in hdmaRun
+  }
+
+  // ── HDMA per-scanline — called at HBlank of each active display line ──────
+  // Transfers data from table to the destination PPU register(s), then
+  // decrements the line counter. When a segment expires it loads the next.
+  hdmaRun() {
+    // bytes per transfer unit for each pattern mode
+    const PATTERNS = [[0],[0,1],[0,0],[0,0,1,1],[0,1,2,3],[0,1],[0,0],[0,0,1,1]];
+
+    for (let ch = 0; ch < 8; ch++) {
+      if (!(this.hdmaen & (1 << ch))) continue;
+      const c = this.dmaChannels[ch];
+      if (c.hdmaFinished) continue;
+
+      const pattern  = PATTERNS[c.ctrl & 7];
+      const indirect = !!(c.ctrl & 0x40);
+      // Bit 7 of lineCounter = "repeat" flag: 1 = transfer every line,
+      // 0 = transfer only on the first line of this segment.
+      // We always transfer for simplicity (works for the common repeat case).
+      for (let i = 0; i < pattern.length; i++) {
+        const dest = (0x2100 | c.destReg | pattern[i]) & 0xFFFF;
+        let byte;
+        if (indirect) {
+          byte = this.read((c.tableBank << 16) | (c.indirectAddr & 0xFFFF));
+          c.indirectAddr = (c.indirectAddr + 1) & 0xFFFF;
+        } else {
+          byte = this.read((c.tableBank << 16) | c.tableAddr);
+          c.tableAddr = (c.tableAddr + 1) & 0xFFFF;
+        }
+        this.write(dest, byte);
+      }
+
+      // Decrement the low 7 bits of lineCounter
+      const lo7 = (c.lineCounter & 0x7F) - 1;
+      if (lo7 > 0) {
+        c.lineCounter = (c.lineCounter & 0x80) | lo7;
+      } else {
+        // Segment exhausted — reload from table
+        c.lineCounter = this.read((c.tableBank << 16) | c.tableAddr);
+        c.tableAddr   = (c.tableAddr + 1) & 0xFFFF;
+        if (c.lineCounter === 0) { c.hdmaFinished = true; continue; }
+        if (indirect) {
+          const lo = this.read((c.tableBank << 16) | c.tableAddr);
+          c.tableAddr = (c.tableAddr + 1) & 0xFFFF;
+          const hi = this.read((c.tableBank << 16) | c.tableAddr);
+          c.tableAddr = (c.tableAddr + 1) & 0xFFFF;
+          c.indirectAddr = (hi << 8) | lo;
+        }
+      }
+    }
+  }
+
+  // ── H/V timer IRQ ─────────────────────────────────────────────────────────
+  // NMITIMEN bits 5-4: 00=none, 01=H-IRQ every line, 10=V-IRQ at vtime,
+  //                    11=H+V-IRQ at htime on vtime scanline.
+  // Called at each scanline boundary; H-position is approximated as 0.
+  checkIRQ(scanline) {
+    const mode = (this.nmitimen >> 4) & 3;
+    if (!mode) return;
+    let fire = false;
+    if      (mode === 1) fire = true;                          // H every line
+    else if (mode === 2) fire = (scanline === this.vtime);     // V only
+    else if (mode === 3) fire = (scanline === this.vtime);     // H+V
+    if (fire) {
+      this.irqFlag = 0x80;
+      if (this.cpu) this.cpu.pendingIRQ = true;
+    }
+  }
+}
+
+// ── CPU  (WDC 65C816 / Ricoh 5A22) ───────────────────────────────────────────
+// Full native + emulation mode, all 256 opcodes, all addressing modes,
+// NMI / IRQ / BRK / COP vectors, WAI / STP, hardware block-move (MVN/MVP).
+class CPU65816 {
+  constructor(bus) {
+    this.bus = bus;
+    this.PC=0; this.PBR=0; this.DBR=0;
+    this.SP=0x01FF; this.DP=0;
+    this.A=0; this.X=0; this.Y=0;
+    this.P=0x34;   // NV1BDIZC — M=1,X=1,I=1 on power-up
+    this.E=true;   // emulation mode
+    this.pendingNMI=false; this.pendingIRQ=false;
+    this.stopped=false; this.waiting=false;
+    this.cycles=0; // total master cycles executed
+    // PC trace — ring buffer of last 24 unique {bank,pc,op} executed
+    this.pcTrace=[]; this._lastTracedPC=-1;
+    // Rolling history of last 16 unique PBR:PC values (for diagnostics)
+    this.pcHistory=[]; this._lastTracePc=-1;
+  }
+
+  // ── Status flag helpers ───────────────────────────────────────────────────
+  get fN(){ return !!(this.P&0x80); }
+  get fV(){ return !!(this.P&0x40); }
+  get fM(){ return this.E||!!(this.P&0x20); }  // 1 = 8-bit accumulator
+  get fX(){ return this.E||!!(this.P&0x10); }  // 1 = 8-bit index
+  get fD(){ return !!(this.P&0x08); }
+  get fI(){ return !!(this.P&0x04); }
+  get fZ(){ return !!(this.P&0x02); }
+  get fC(){ return !!(this.P&0x01); }
+  sN(v){ v?this.P|=0x80:this.P&=~0x80; }
+  sV(v){ v?this.P|=0x40:this.P&=~0x40; }
+  sM(v){ v?this.P|=0x20:this.P&=~0x20; }
+  sX(v){ v?this.P|=0x10:this.P&=~0x10; }
+  sD(v){ v?this.P|=0x08:this.P&=~0x08; }
+  sI(v){ v?this.P|=0x04:this.P&=~0x04; }
+  sZ(v){ v?this.P|=0x02:this.P&=~0x02; }
+  sC(v){ v?this.P|=0x01:this.P&=~0x01; }
+
+  // NZ for accumulator-width and index-width
+  nzM(v){ this.sN(!!(v&(this.fM?0x80:0x8000))); this.sZ((v&(this.fM?0xFF:0xFFFF))===0); }
+  nzX(v){ this.sN(!!(v&(this.fX?0x80:0x8000))); this.sZ((v&(this.fX?0xFF:0xFFFF))===0); }
+
+  // ── Bus helpers ───────────────────────────────────────────────────────────
+  rd(a24)       { return this.bus.read(a24&0xFFFFFF); }
+  wr(a24,v)     { this.bus.write(a24&0xFFFFFF, v&0xFF); }
+  r8(bk,ad)     { return this.rd(((bk&0xFF)<<16)|(ad&0xFFFF)); }
+  r16(bk,ad)    { return this.r8(bk,ad)|(this.r8(bk,(ad+1)&0xFFFF)<<8); }
+  r24(bk,ad)    { return this.r8(bk,ad)|(this.r8(bk,(ad+1)&0xFFFF)<<8)|(this.r8(bk,(ad+2)&0xFFFF)<<16); }
+  w8(bk,ad,v)   { this.wr(((bk&0xFF)<<16)|(ad&0xFFFF),v); }
+  w16(bk,ad,v)  { this.w8(bk,ad,v); this.w8(bk,(ad+1)&0xFFFF,v>>8); }
+
+  // PC-relative fetch
+  f8()  { const v=this.r8(this.PBR,this.PC); this.PC=(this.PC+1)&0xFFFF; return v; }
+  f16() { const lo=this.f8(),hi=this.f8(); return (hi<<8)|lo; }
+  f24() { const lo=this.f8(),hi=this.f8(),bk=this.f8(); return (bk<<16)|(hi<<8)|lo; }
+
+  // Stack
+  ph8(v)  { this.w8(0,this.SP,v); this.SP=this.E?(0x100|((this.SP-1)&0xFF)):((this.SP-1)&0xFFFF); }
+  ph16(v) { this.ph8(v>>8); this.ph8(v); }
+  pl8()   { this.SP=this.E?(0x100|((this.SP+1)&0xFF)):((this.SP+1)&0xFFFF); return this.r8(0,this.SP); }
+  pl16()  { const lo=this.pl8(),hi=this.pl8(); return (hi<<8)|lo; }
+
+  // Width-aware memory read / write (respects M flag for accumulator, X for index)
+  rdM(a){ if(this.fM) return this.rd(a)&0xFF; return this.rd(a)|((this.rd((a&0xFF0000)|((a+1)&0xFFFF)))<<8); }
+  wrM(a,v){ this.wr(a,v); if(!this.fM) this.wr((a&0xFF0000)|((a+1)&0xFFFF),v>>8); }
+  rdX(a){ if(this.fX) return this.rd(a)&0xFF; return this.rd(a)|((this.rd((a&0xFF0000)|((a+1)&0xFFFF)))<<8); }
+  wrX(a,v){ this.wr(a,v); if(!this.fX) this.wr((a&0xFF0000)|((a+1)&0xFFFF),v>>8); }
+
+  // ── Addressing mode effective addresses (24-bit) ──────────────────────────
+  amDP()  { const d=this.f8();   return (this.DP+d)&0xFFFF; }
+  amDPX() { const d=this.f8();   return (this.DP+d+this.X)&0xFFFF; }
+  amDPY() { const d=this.f8();   return (this.DP+d+this.Y)&0xFFFF; }
+  amAbs() { return (this.DBR<<16)|this.f16(); }
+  amAbX() { return ((this.DBR<<16)|((this.f16()+this.X)&0xFFFF)); }
+  amAbY() { return ((this.DBR<<16)|((this.f16()+this.Y)&0xFFFF)); }
+  amLng() { return this.f24(); }
+  amLnX() { return (this.f24()+this.X)&0xFFFFFF; }
+  amSR()  { const o=this.f8(); return (this.SP+o)&0xFFFF; }
+  // Indirect
+  amDPI()  { const ea=this.amDP(); return (this.DBR<<16)|(this.r16(0,ea)); }
+  amDPIX() { const d=this.f8(), ptr=(this.DP+d+this.X)&0xFFFF; return (this.DBR<<16)|this.r16(0,ptr); }
+  amDPIY() { const ea=this.amDP(); return ((this.DBR<<16)|((this.r16(0,ea)+this.Y)&0xFFFF)); }
+  amDPIL() { const ea=this.amDP(); return this.r24(0,ea); }
+  amDPILY(){ const ea=this.amDP(); return (this.r24(0,ea)+this.Y)&0xFFFFFF; }
+  amSRIY() { const ptr=(this.SP+this.f8())&0xFFFF; return ((this.DBR<<16)|((this.r16(0,ptr)+this.Y)&0xFFFF)); }
+  // Immediate addresses (the bytes sit in the instruction stream)
+  amImmM() { const a=(this.PBR<<16)|this.PC; this.PC=(this.PC+(this.fM?1:2))&0xFFFF; return a; }
+  amImmX() { const a=(this.PBR<<16)|this.PC; this.PC=(this.PC+(this.fX?1:2))&0xFFFF; return a; }
+
+  // ── ALU helpers ───────────────────────────────────────────────────────────
+  _adc(val) {
+    if (this.fM) {
+      const a=this.A&0xFF, r=a+(val&0xFF)+(this.fC?1:0);
+      this.sV(!!(~(a^val)&(a^r)&0x80)); this.sC(r>0xFF);
+      this.A=(this.A&0xFF00)|(r&0xFF); this.nzM(this.A);
+    } else {
+      const a=this.A&0xFFFF, r=a+(val&0xFFFF)+(this.fC?1:0);
+      this.sV(!!(~(a^val)&(a^r)&0x8000)); this.sC(r>0xFFFF);
+      this.A=r&0xFFFF; this.nzM(this.A);
+    }
+  }
+  _sbc(val) {
+    if (this.fM) {
+      const a=this.A&0xFF, v=val&0xFF, r=a-v-(this.fC?0:1);
+      this.sV(!!((a^v)&(a^r)&0x80)); this.sC(r>=0);
+      this.A=(this.A&0xFF00)|(r&0xFF); this.nzM(this.A);
+    } else {
+      const a=this.A&0xFFFF, v=val&0xFFFF, r=a-v-(this.fC?0:1);
+      this.sV(!!((a^v)&(a^r)&0x8000)); this.sC(r>=0);
+      this.A=r&0xFFFF; this.nzM(this.A);
+    }
+  }
+  _cmpM(a,b) {
+    if(this.fM){const r=(a&0xFF)-(b&0xFF); this.sN(!!(r&0x80));this.sZ((r&0xFF)===0);this.sC(r>=0);}
+    else{const r=(a&0xFFFF)-(b&0xFFFF); this.sN(!!(r&0x8000));this.sZ((r&0xFFFF)===0);this.sC(r>=0);}
+  }
+  _cmpX(a,b) {
+    if(this.fX){const r=(a&0xFF)-(b&0xFF); this.sN(!!(r&0x80));this.sZ((r&0xFF)===0);this.sC(r>=0);}
+    else{const r=(a&0xFFFF)-(b&0xFFFF); this.sN(!!(r&0x8000));this.sZ((r&0xFFFF)===0);this.sC(r>=0);}
+  }
+  _asl(ea) { // null = accumulator
+    if(ea===null){if(this.fM){this.sC(!!(this.A&0x80));const v=(this.A<<1)&0xFF;this.A=(this.A&0xFF00)|v;this.nzM(v);}else{this.sC(!!(this.A&0x8000));this.A=(this.A<<1)&0xFFFF;this.nzM(this.A);}}
+    else{const o=this.rdM(ea);if(this.fM){this.sC(!!(o&0x80));const v=(o<<1)&0xFF;this.wrM(ea,v);this.nzM(v);}else{this.sC(!!(o&0x8000));const v=(o<<1)&0xFFFF;this.wrM(ea,v);this.nzM(v);}}
+  }
+  _lsr(ea) {
+    if(ea===null){if(this.fM){this.sC(!!(this.A&1));const v=(this.A&0xFF)>>1;this.A=(this.A&0xFF00)|v;this.nzM(v);}else{this.sC(!!(this.A&1));this.A>>=1;this.nzM(this.A);}}
+    else{const o=this.rdM(ea);if(this.fM){this.sC(!!(o&1));const v=(o&0xFF)>>1;this.wrM(ea,v);this.nzM(v);}else{this.sC(!!(o&1));const v=(o&0xFFFF)>>1;this.wrM(ea,v);this.nzM(v);}}
+  }
+  _rol(ea) {
+    const c=this.fC?1:0;
+    if(ea===null){if(this.fM){this.sC(!!(this.A&0x80));const v=((this.A<<1)|c)&0xFF;this.A=(this.A&0xFF00)|v;this.nzM(v);}else{this.sC(!!(this.A&0x8000));this.A=((this.A<<1)|c)&0xFFFF;this.nzM(this.A);}}
+    else{const o=this.rdM(ea);if(this.fM){this.sC(!!(o&0x80));const v=((o<<1)|c)&0xFF;this.wrM(ea,v);this.nzM(v);}else{this.sC(!!(o&0x8000));const v=((o<<1)|c)&0xFFFF;this.wrM(ea,v);this.nzM(v);}}
+  }
+  _ror(ea) {
+    const c=this.fC?1:0;
+    if(ea===null){if(this.fM){this.sC(!!(this.A&1));const v=((c<<7)|(this.A>>1))&0xFF;this.A=(this.A&0xFF00)|v;this.nzM(v);}else{this.sC(!!(this.A&1));this.A=((c<<15)|(this.A>>1))&0xFFFF;this.nzM(this.A);}}
+    else{const o=this.rdM(ea);if(this.fM){this.sC(!!(o&1));const v=((c<<7)|((o&0xFF)>>1))&0xFF;this.wrM(ea,v);this.nzM(v);}else{this.sC(!!(o&1));const v=((c<<15)|((o&0xFFFF)>>1))&0xFFFF;this.wrM(ea,v);this.nzM(v);}}
+  }
+  _andA(v) { if(this.fM){this.A=(this.A&0xFF00)|((this.A&v)&0xFF);}else{this.A=(this.A&v)&0xFFFF;} this.nzM(this.A); }
+  _oraA(v) { if(this.fM){this.A=(this.A&0xFF00)|((this.A|v)&0xFF);}else{this.A=(this.A|v)&0xFFFF;} this.nzM(this.A); }
+  _eorA(v) { if(this.fM){this.A=(this.A&0xFF00)|((this.A^v)&0xFF);}else{this.A=(this.A^v)&0xFFFF;} this.nzM(this.A); }
+  _ldA(v)  { if(this.fM){this.A=(this.A&0xFF00)|(v&0xFF);}else{this.A=v&0xFFFF;} this.nzM(this.A); }
+
+  _branch(t) { const o=this.f8(); if(!t)return 2; this.PC=(this.PC+(o<0x80?o:o-0x100))&0xFFFF; return 3; }
+
+  // ── Interrupt handlers ────────────────────────────────────────────────────
+  _doNMI() {
+    if(!this.E) this.ph8(this.PBR);
+    this.ph16(this.PC); this.ph8(this.P&(this.E?0xEF:0xFF));
+    this.sI(true); this.PBR=0;
+    this.PC=this.r16(0,this.E?0xFFFA:0xFFEA);
+    this.pendingNMI=false; this.waiting=false;
+  }
+  _doIRQ() {
+    if(!this.E) this.ph8(this.PBR);
+    this.ph16(this.PC); this.ph8(this.P&(this.E?0xEF:0xFF));
+    this.sI(true); this.PBR=0;
+    this.PC=this.r16(0,this.E?0xFFFE:0xFFEE);
+    this.pendingIRQ=false; this.waiting=false;
+  }
+
+  reset() {
+    this.E=true; this.P=0x34; this.SP=0x01FF; this.DP=this.DBR=this.PBR=0;
+    this.stopped=false; this.waiting=false; this.cycles=0;
+    this.PC=this.r16(0,0xFFFC);
+    this.pcTrace=[]; this._lastTracedPC=-1;
+  }
+
+  // ── Main step ─────────────────────────────────────────────────────────────
+  step() {
+    if(this.stopped) return 2;
+    // WAI releases on any interrupt signal — NMI signal (nmiFlag) fires at VBlank
+    // regardless of whether NMI is enabled in NMITIMEN. On real hardware WAI just
+    // resumes execution if the interrupt is disabled; it vectors if it is enabled.
+    if(this.waiting){
+      const nmiSignal = !!(this.bus.nmiFlag & 0x80);
+      if(!this.pendingNMI && !this.pendingIRQ && !nmiSignal) return 2;
+      this.waiting=false;
+    }
+    if(this.pendingNMI){ this._doNMI(); return 8; }
+    if(this.pendingIRQ&&!this.fI){ this._doIRQ(); return 8; }
+
+    const op=this.f8();
+    // Record unique PC trace entry (skip if same bank:PC as last time)
+    const traceKey=(this.PBR<<16)|(this.PC-1)&0xFFFF;
+    if(traceKey!==this._lastTracedPC){
+      this._lastTracedPC=traceKey;
+      this.pcTrace.push({bank:this.PBR,pc:(this.PC-1)&0xFFFF,op});
+      if(this.pcTrace.length>24) this.pcTrace.shift();
+    }
+    let cy=2;
+
+    switch(op){
+      // ──── LDA ─────────────────────────────────────────────────────────────
+      case 0xA9:{this._ldA(this.rdM(this.amImmM()));cy=this.fM?2:3;break;}
+      case 0xA5:{this._ldA(this.rdM(this.amDP()));cy=3;break;}
+      case 0xB5:{this._ldA(this.rdM(this.amDPX()));cy=4;break;}
+      case 0xAD:{this._ldA(this.rdM(this.amAbs()));cy=4;break;}
+      case 0xBD:{this._ldA(this.rdM(this.amAbX()));cy=4;break;}
+      case 0xB9:{this._ldA(this.rdM(this.amAbY()));cy=4;break;}
+      case 0xAF:{this._ldA(this.rdM(this.amLng()));cy=5;break;}
+      case 0xBF:{this._ldA(this.rdM(this.amLnX()));cy=5;break;}
+      case 0xA1:{this._ldA(this.rdM(this.amDPIX()));cy=6;break;}
+      case 0xB1:{this._ldA(this.rdM(this.amDPIY()));cy=5;break;}
+      case 0xB2:{this._ldA(this.rdM(this.amDPI()));cy=5;break;}
+      case 0xA7:{this._ldA(this.rdM(this.amDPIL()));cy=6;break;}
+      case 0xB7:{this._ldA(this.rdM(this.amDPILY()));cy=6;break;}
+      case 0xA3:{this._ldA(this.rdM(this.amSR()));cy=4;break;}
+      case 0xB3:{this._ldA(this.rdM(this.amSRIY()));cy=7;break;}
+
+      // ──── LDX ─────────────────────────────────────────────────────────────
+      case 0xA2:{this.X=this.rdX(this.amImmX());this.nzX(this.X);cy=this.fX?2:3;break;}
+      case 0xA6:{this.X=this.rdX(this.amDP());this.nzX(this.X);cy=3;break;}
+      case 0xB6:{this.X=this.rdX(this.amDPY());this.nzX(this.X);cy=4;break;}
+      case 0xAE:{this.X=this.rdX(this.amAbs());this.nzX(this.X);cy=4;break;}
+      case 0xBE:{this.X=this.rdX(this.amAbY());this.nzX(this.X);cy=4;break;}
+
+      // ──── LDY ─────────────────────────────────────────────────────────────
+      case 0xA0:{this.Y=this.rdX(this.amImmX());this.nzX(this.Y);cy=this.fX?2:3;break;}
+      case 0xA4:{this.Y=this.rdX(this.amDP());this.nzX(this.Y);cy=3;break;}
+      case 0xB4:{this.Y=this.rdX(this.amDPX());this.nzX(this.Y);cy=4;break;}
+      case 0xAC:{this.Y=this.rdX(this.amAbs());this.nzX(this.Y);cy=4;break;}
+      case 0xBC:{this.Y=this.rdX(this.amAbX());this.nzX(this.Y);cy=4;break;}
+
+      // ──── STA ─────────────────────────────────────────────────────────────
+      case 0x85:{this.wrM(this.amDP(),this.A);cy=3;break;}
+      case 0x95:{this.wrM(this.amDPX(),this.A);cy=4;break;}
+      case 0x8D:{this.wrM(this.amAbs(),this.A);cy=4;break;}
+      case 0x9D:{this.wrM(this.amAbX(),this.A);cy=5;break;}
+      case 0x99:{this.wrM(this.amAbY(),this.A);cy=5;break;}
+      case 0x8F:{this.wrM(this.amLng(),this.A);cy=5;break;}
+      case 0x9F:{this.wrM(this.amLnX(),this.A);cy=5;break;}
+      case 0x81:{this.wrM(this.amDPIX(),this.A);cy=6;break;}
+      case 0x91:{this.wrM(this.amDPIY(),this.A);cy=6;break;}
+      case 0x92:{this.wrM(this.amDPI(),this.A);cy=5;break;}
+      case 0x87:{this.wrM(this.amDPIL(),this.A);cy=6;break;}
+      case 0x97:{this.wrM(this.amDPILY(),this.A);cy=6;break;}
+      case 0x83:{this.wrM(this.amSR(),this.A);cy=4;break;}
+      case 0x93:{this.wrM(this.amSRIY(),this.A);cy=7;break;}
+
+      // ──── STX / STY / STZ ────────────────────────────────────────────────
+      case 0x86:{this.wrX(this.amDP(),this.X);cy=3;break;}
+      case 0x96:{this.wrX(this.amDPY(),this.X);cy=4;break;}
+      case 0x8E:{this.wrX(this.amAbs(),this.X);cy=4;break;}
+      case 0x84:{this.wrX(this.amDP(),this.Y);cy=3;break;}
+      case 0x94:{this.wrX(this.amDPX(),this.Y);cy=4;break;}
+      case 0x8C:{this.wrX(this.amAbs(),this.Y);cy=4;break;}
+      case 0x64:{this.wrM(this.amDP(),0);cy=3;break;}
+      case 0x74:{this.wrM(this.amDPX(),0);cy=4;break;}
+      case 0x9C:{this.wrM(this.amAbs(),0);cy=4;break;}
+      case 0x9E:{this.wrM(this.amAbX(),0);cy=5;break;}
+
+      // ──── Transfers ───────────────────────────────────────────────────────
+      case 0xAA:{this.X=this.fX?this.A&0xFF:this.A&0xFFFF;this.nzX(this.X);break;} // TAX
+      case 0xA8:{this.Y=this.fX?this.A&0xFF:this.A&0xFFFF;this.nzX(this.Y);break;} // TAY
+      case 0x8A:{this._ldA(this.X);break;}  // TXA
+      case 0x98:{this._ldA(this.Y);break;}  // TYA
+      case 0xBA:{this.X=this.fX?this.SP&0xFF:this.SP&0xFFFF;this.nzX(this.X);break;} // TSX
+      case 0x9A:{this.SP=this.E?0x100|(this.X&0xFF):this.X&0xFFFF;break;} // TXS
+      case 0x9B:{this.Y=this.X;this.nzX(this.Y);break;} // TXY
+      case 0xBB:{this.X=this.Y;this.nzX(this.X);break;} // TYX
+      case 0x5B:{this.DP=this.A&0xFFFF;this.nzX(this.DP);break;}  // TCD
+      case 0x7B:{this.A=this.DP;this.nzX(this.A);break;} // TDC
+      case 0x1B:{this.SP=this.E?0x100|(this.A&0xFF):this.A&0xFFFF;break;} // TCS
+      case 0x3B:{this.A=this.SP;this.nzX(this.A);break;} // TSC
+
+      // ──── Stack ───────────────────────────────────────────────────────────
+      case 0x48:{this.fM?this.ph8(this.A):this.ph16(this.A);cy=3;break;}  // PHA
+      case 0xDA:{this.fX?this.ph8(this.X):this.ph16(this.X);cy=3;break;}  // PHX
+      case 0x5A:{this.fX?this.ph8(this.Y):this.ph16(this.Y);cy=3;break;}  // PHY
+      case 0x08:{this.ph8(this.E?this.P|0x30:this.P);cy=3;break;}         // PHP
+      case 0x8B:{this.ph8(this.DBR);cy=3;break;}  // PHB
+      case 0x0B:{this.ph16(this.DP);cy=4;break;}  // PHD
+      case 0x4B:{this.ph8(this.PBR);cy=3;break;}  // PHK
+      case 0xF4:{this.ph16(this.f16());cy=5;break;} // PEA
+      case 0xD4:{this.ph16(this.r16(0,this.amDP()));cy=6;break;} // PEI
+      case 0x62:{const o=this.f16();this.ph16((this.PC+(o<0x8000?o:o-0x10000))&0xFFFF);cy=6;break;} // PER
+
+      case 0x68:{const v=this.fM?this.pl8():this.pl16();this._ldA(v);cy=4;break;} // PLA
+      case 0xFA:{this.X=this.fX?this.pl8():this.pl16();this.nzX(this.X);cy=4;break;} // PLX
+      case 0x7A:{this.Y=this.fX?this.pl8():this.pl16();this.nzX(this.Y);cy=4;break;} // PLY
+      case 0x28:{ // PLP
+        this.P=this.pl8();
+        if(this.E) this.P|=0x30;
+        if(this.fX){this.X&=0xFF;this.Y&=0xFF;}
+        cy=4;break;
+      }
+      case 0xAB:{this.DBR=this.pl8();this.nzX(this.DBR);cy=4;break;} // PLB
+      case 0x2B:{this.DP=this.pl16();this.nzX(this.DP);cy=5;break;}  // PLD
+
+      // ──── ADC ─────────────────────────────────────────────────────────────
+      case 0x69:{this._adc(this.rdM(this.amImmM()));cy=this.fM?2:3;break;}
+      case 0x65:{this._adc(this.rdM(this.amDP()));cy=3;break;}
+      case 0x75:{this._adc(this.rdM(this.amDPX()));cy=4;break;}
+      case 0x6D:{this._adc(this.rdM(this.amAbs()));cy=4;break;}
+      case 0x7D:{this._adc(this.rdM(this.amAbX()));cy=4;break;}
+      case 0x79:{this._adc(this.rdM(this.amAbY()));cy=4;break;}
+      case 0x6F:{this._adc(this.rdM(this.amLng()));cy=5;break;}
+      case 0x7F:{this._adc(this.rdM(this.amLnX()));cy=5;break;}
+      case 0x61:{this._adc(this.rdM(this.amDPIX()));cy=6;break;}
+      case 0x71:{this._adc(this.rdM(this.amDPIY()));cy=5;break;}
+      case 0x72:{this._adc(this.rdM(this.amDPI()));cy=5;break;}
+      case 0x67:{this._adc(this.rdM(this.amDPIL()));cy=6;break;}
+      case 0x77:{this._adc(this.rdM(this.amDPILY()));cy=6;break;}
+      case 0x63:{this._adc(this.rdM(this.amSR()));cy=4;break;}
+      case 0x73:{this._adc(this.rdM(this.amSRIY()));cy=7;break;}
+
+      // ──── SBC ─────────────────────────────────────────────────────────────
+      case 0xE9:{this._sbc(this.rdM(this.amImmM()));cy=this.fM?2:3;break;}
+      case 0xE5:{this._sbc(this.rdM(this.amDP()));cy=3;break;}
+      case 0xF5:{this._sbc(this.rdM(this.amDPX()));cy=4;break;}
+      case 0xED:{this._sbc(this.rdM(this.amAbs()));cy=4;break;}
+      case 0xFD:{this._sbc(this.rdM(this.amAbX()));cy=4;break;}
+      case 0xF9:{this._sbc(this.rdM(this.amAbY()));cy=4;break;}
+      case 0xEF:{this._sbc(this.rdM(this.amLng()));cy=5;break;}
+      case 0xFF:{this._sbc(this.rdM(this.amLnX()));cy=5;break;}
+      case 0xE1:{this._sbc(this.rdM(this.amDPIX()));cy=6;break;}
+      case 0xF1:{this._sbc(this.rdM(this.amDPIY()));cy=5;break;}
+      case 0xF2:{this._sbc(this.rdM(this.amDPI()));cy=5;break;}
+      case 0xE7:{this._sbc(this.rdM(this.amDPIL()));cy=6;break;}
+      case 0xF7:{this._sbc(this.rdM(this.amDPILY()));cy=6;break;}
+      case 0xE3:{this._sbc(this.rdM(this.amSR()));cy=4;break;}
+      case 0xF3:{this._sbc(this.rdM(this.amSRIY()));cy=7;break;}
+
+      // ──── CMP ─────────────────────────────────────────────────────────────
+      case 0xC9:{this._cmpM(this.A,this.rdM(this.amImmM()));cy=this.fM?2:3;break;}
+      case 0xC5:{this._cmpM(this.A,this.rdM(this.amDP()));cy=3;break;}
+      case 0xD5:{this._cmpM(this.A,this.rdM(this.amDPX()));cy=4;break;}
+      case 0xCD:{this._cmpM(this.A,this.rdM(this.amAbs()));cy=4;break;}
+      case 0xDD:{this._cmpM(this.A,this.rdM(this.amAbX()));cy=4;break;}
+      case 0xD9:{this._cmpM(this.A,this.rdM(this.amAbY()));cy=4;break;}
+      case 0xCF:{this._cmpM(this.A,this.rdM(this.amLng()));cy=5;break;}
+      case 0xDF:{this._cmpM(this.A,this.rdM(this.amLnX()));cy=5;break;}
+      case 0xC1:{this._cmpM(this.A,this.rdM(this.amDPIX()));cy=6;break;}
+      case 0xD1:{this._cmpM(this.A,this.rdM(this.amDPIY()));cy=5;break;}
+      case 0xD2:{this._cmpM(this.A,this.rdM(this.amDPI()));cy=5;break;}
+      case 0xC7:{this._cmpM(this.A,this.rdM(this.amDPIL()));cy=6;break;}
+      case 0xD7:{this._cmpM(this.A,this.rdM(this.amDPILY()));cy=6;break;}
+      case 0xC3:{this._cmpM(this.A,this.rdM(this.amSR()));cy=4;break;}
+      case 0xD3:{this._cmpM(this.A,this.rdM(this.amSRIY()));cy=7;break;}
+
+      // ──── CPX / CPY ───────────────────────────────────────────────────────
+      case 0xE0:{this._cmpX(this.X,this.rdX(this.amImmX()));cy=this.fX?2:3;break;}
+      case 0xE4:{this._cmpX(this.X,this.rdX(this.amDP()));cy=3;break;}
+      case 0xEC:{this._cmpX(this.X,this.rdX(this.amAbs()));cy=4;break;}
+      case 0xC0:{this._cmpX(this.Y,this.rdX(this.amImmX()));cy=this.fX?2:3;break;}
+      case 0xC4:{this._cmpX(this.Y,this.rdX(this.amDP()));cy=3;break;}
+      case 0xCC:{this._cmpX(this.Y,this.rdX(this.amAbs()));cy=4;break;}
+
+      // ──── AND ─────────────────────────────────────────────────────────────
+      case 0x29:{this._andA(this.rdM(this.amImmM()));cy=this.fM?2:3;break;}
+      case 0x25:{this._andA(this.rdM(this.amDP()));cy=3;break;}
+      case 0x35:{this._andA(this.rdM(this.amDPX()));cy=4;break;}
+      case 0x2D:{this._andA(this.rdM(this.amAbs()));cy=4;break;}
+      case 0x3D:{this._andA(this.rdM(this.amAbX()));cy=4;break;}
+      case 0x39:{this._andA(this.rdM(this.amAbY()));cy=4;break;}
+      case 0x2F:{this._andA(this.rdM(this.amLng()));cy=5;break;}
+      case 0x3F:{this._andA(this.rdM(this.amLnX()));cy=5;break;}
+      case 0x21:{this._andA(this.rdM(this.amDPIX()));cy=6;break;}
+      case 0x31:{this._andA(this.rdM(this.amDPIY()));cy=5;break;}
+      case 0x32:{this._andA(this.rdM(this.amDPI()));cy=5;break;}
+      case 0x27:{this._andA(this.rdM(this.amDPIL()));cy=6;break;}
+      case 0x37:{this._andA(this.rdM(this.amDPILY()));cy=6;break;}
+      case 0x23:{this._andA(this.rdM(this.amSR()));cy=4;break;}
+      case 0x33:{this._andA(this.rdM(this.amSRIY()));cy=7;break;}
+
+      // ──── ORA ─────────────────────────────────────────────────────────────
+      case 0x09:{this._oraA(this.rdM(this.amImmM()));cy=this.fM?2:3;break;}
+      case 0x05:{this._oraA(this.rdM(this.amDP()));cy=3;break;}
+      case 0x15:{this._oraA(this.rdM(this.amDPX()));cy=4;break;}
+      case 0x0D:{this._oraA(this.rdM(this.amAbs()));cy=4;break;}
+      case 0x1D:{this._oraA(this.rdM(this.amAbX()));cy=4;break;}
+      case 0x19:{this._oraA(this.rdM(this.amAbY()));cy=4;break;}
+      case 0x0F:{this._oraA(this.rdM(this.amLng()));cy=5;break;}
+      case 0x1F:{this._oraA(this.rdM(this.amLnX()));cy=5;break;}
+      case 0x01:{this._oraA(this.rdM(this.amDPIX()));cy=6;break;}
+      case 0x11:{this._oraA(this.rdM(this.amDPIY()));cy=5;break;}
+      case 0x12:{this._oraA(this.rdM(this.amDPI()));cy=5;break;}
+      case 0x07:{this._oraA(this.rdM(this.amDPIL()));cy=6;break;}
+      case 0x17:{this._oraA(this.rdM(this.amDPILY()));cy=6;break;}
+      case 0x03:{this._oraA(this.rdM(this.amSR()));cy=4;break;}
+      case 0x13:{this._oraA(this.rdM(this.amSRIY()));cy=7;break;}
+
+      // ──── EOR ─────────────────────────────────────────────────────────────
+      case 0x49:{this._eorA(this.rdM(this.amImmM()));cy=this.fM?2:3;break;}
+      case 0x45:{this._eorA(this.rdM(this.amDP()));cy=3;break;}
+      case 0x55:{this._eorA(this.rdM(this.amDPX()));cy=4;break;}
+      case 0x4D:{this._eorA(this.rdM(this.amAbs()));cy=4;break;}
+      case 0x5D:{this._eorA(this.rdM(this.amAbX()));cy=4;break;}
+      case 0x59:{this._eorA(this.rdM(this.amAbY()));cy=4;break;}
+      case 0x4F:{this._eorA(this.rdM(this.amLng()));cy=5;break;}
+      case 0x5F:{this._eorA(this.rdM(this.amLnX()));cy=5;break;}
+      case 0x41:{this._eorA(this.rdM(this.amDPIX()));cy=6;break;}
+      case 0x51:{this._eorA(this.rdM(this.amDPIY()));cy=5;break;}
+      case 0x52:{this._eorA(this.rdM(this.amDPI()));cy=5;break;}
+      case 0x47:{this._eorA(this.rdM(this.amDPIL()));cy=6;break;}
+      case 0x57:{this._eorA(this.rdM(this.amDPILY()));cy=6;break;}
+      case 0x43:{this._eorA(this.rdM(this.amSR()));cy=4;break;}
+      case 0x53:{this._eorA(this.rdM(this.amSRIY()));cy=7;break;}
+
+      // ──── TSB / TRB ───────────────────────────────────────────────────────
+      // TSB: Z = !(A & mem), mem |= A
+      case 0x04:{const a=this.amDP(); const v=this.rdM(a); this.sZ((this.A&v)===0); this.wrM(a,v|(this.fM?this.A&0xFF:this.A));cy=5;break;}
+      case 0x0C:{const a=this.amAbs();const v=this.rdM(a); this.sZ((this.A&v)===0); this.wrM(a,v|(this.fM?this.A&0xFF:this.A));cy=6;break;}
+      // TRB: Z = !(A & mem), mem &= ~A
+      case 0x14:{const a=this.amDP(); const v=this.rdM(a); this.sZ((this.A&v)===0); this.wrM(a,v&~(this.fM?this.A&0xFF:this.A)&(this.fM?0xFF:0xFFFF));cy=5;break;}
+      case 0x1C:{const a=this.amAbs();const v=this.rdM(a); this.sZ((this.A&v)===0); this.wrM(a,v&~(this.fM?this.A&0xFF:this.A)&(this.fM?0xFF:0xFFFF));cy=6;break;}
+
+      // ──── BIT ─────────────────────────────────────────────────────────────
+      case 0x89:{const v=this.rdM(this.amImmM());this.sZ((this.A&v)===0);cy=this.fM?2:3;break;} // BIT imm — only Z (no N/V)
+      case 0x24:{const v=this.rdM(this.amDP());this.sN(!!(v&(this.fM?0x80:0x8000)));this.sV(!!(v&(this.fM?0x40:0x4000)));this.sZ((this.A&v)===0);cy=3;break;}
+      case 0x34:{const v=this.rdM(this.amDPX());this.sN(!!(v&(this.fM?0x80:0x8000)));this.sV(!!(v&(this.fM?0x40:0x4000)));this.sZ((this.A&v)===0);cy=4;break;}
+      case 0x2C:{const v=this.rdM(this.amAbs());this.sN(!!(v&(this.fM?0x80:0x8000)));this.sV(!!(v&(this.fM?0x40:0x4000)));this.sZ((this.A&v)===0);cy=4;break;}
+      case 0x3C:{const v=this.rdM(this.amAbX());this.sN(!!(v&(this.fM?0x80:0x8000)));this.sV(!!(v&(this.fM?0x40:0x4000)));this.sZ((this.A&v)===0);cy=4;break;}
+
+      // ──── ASL / LSR / ROL / ROR ───────────────────────────────────────────
+      case 0x0A:{this._asl(null);cy=2;break;} case 0x06:{this._asl(this.amDP());cy=5;break;}
+      case 0x16:{this._asl(this.amDPX());cy=6;break;} case 0x0E:{this._asl(this.amAbs());cy=6;break;}
+      case 0x1E:{this._asl(this.amAbX());cy=7;break;}
+      case 0x4A:{this._lsr(null);cy=2;break;} case 0x46:{this._lsr(this.amDP());cy=5;break;}
+      case 0x56:{this._lsr(this.amDPX());cy=6;break;} case 0x4E:{this._lsr(this.amAbs());cy=6;break;}
+      case 0x5E:{this._lsr(this.amAbX());cy=7;break;}
+      case 0x2A:{this._rol(null);cy=2;break;} case 0x26:{this._rol(this.amDP());cy=5;break;}
+      case 0x36:{this._rol(this.amDPX());cy=6;break;} case 0x2E:{this._rol(this.amAbs());cy=6;break;}
+      case 0x3E:{this._rol(this.amAbX());cy=7;break;}
+      case 0x6A:{this._ror(null);cy=2;break;} case 0x66:{this._ror(this.amDP());cy=5;break;}
+      case 0x76:{this._ror(this.amDPX());cy=6;break;} case 0x6E:{this._ror(this.amAbs());cy=6;break;}
+      case 0x7E:{this._ror(this.amAbX());cy=7;break;}
+
+      // ──── INC / DEC ───────────────────────────────────────────────────────
+      case 0x1A:{const m=this.fM;const v=m?((this.A&0xFF)+1)&0xFF:(this.A+1)&0xFFFF;this._ldA(m?(this.A&0xFF00)|v:v);cy=2;break;} // INC A
+      case 0x3A:{const m=this.fM;const v=m?((this.A&0xFF)-1)&0xFF:(this.A-1)&0xFFFF;this._ldA(m?(this.A&0xFF00)|v:v);cy=2;break;} // DEC A
+      case 0xE6:{const a=this.amDP();const v=(this.rdM(a)+1)&(this.fM?0xFF:0xFFFF);this.wrM(a,v);this.nzM(v);cy=5;break;}
+      case 0xF6:{const a=this.amDPX();const v=(this.rdM(a)+1)&(this.fM?0xFF:0xFFFF);this.wrM(a,v);this.nzM(v);cy=6;break;}
+      case 0xEE:{const a=this.amAbs();const v=(this.rdM(a)+1)&(this.fM?0xFF:0xFFFF);this.wrM(a,v);this.nzM(v);cy=6;break;}
+      case 0xFE:{const a=this.amAbX();const v=(this.rdM(a)+1)&(this.fM?0xFF:0xFFFF);this.wrM(a,v);this.nzM(v);cy=7;break;}
+      case 0xC6:{const a=this.amDP();const v=(this.rdM(a)-1)&(this.fM?0xFF:0xFFFF);this.wrM(a,v);this.nzM(v);cy=5;break;}
+      case 0xD6:{const a=this.amDPX();const v=(this.rdM(a)-1)&(this.fM?0xFF:0xFFFF);this.wrM(a,v);this.nzM(v);cy=6;break;}
+      case 0xCE:{const a=this.amAbs();const v=(this.rdM(a)-1)&(this.fM?0xFF:0xFFFF);this.wrM(a,v);this.nzM(v);cy=6;break;}
+      case 0xDE:{const a=this.amAbX();const v=(this.rdM(a)-1)&(this.fM?0xFF:0xFFFF);this.wrM(a,v);this.nzM(v);cy=7;break;}
+      case 0xE8:{this.X=(this.X+1)&(this.fX?0xFF:0xFFFF);this.nzX(this.X);break;} // INX
+      case 0xC8:{this.Y=(this.Y+1)&(this.fX?0xFF:0xFFFF);this.nzX(this.Y);break;} // INY
+      case 0xCA:{this.X=(this.X-1)&(this.fX?0xFF:0xFFFF);this.nzX(this.X);break;} // DEX
+      case 0x88:{this.Y=(this.Y-1)&(this.fX?0xFF:0xFFFF);this.nzX(this.Y);break;} // DEY
+
+      // ──── JMP / JML ───────────────────────────────────────────────────────
+      case 0x4C:{this.PC=this.f16();cy=3;break;} // JMP abs
+      case 0x5C:{const a=this.f24();this.PBR=(a>>16)&0xFF;this.PC=a&0xFFFF;cy=4;break;} // JML
+      case 0x6C:{const p=this.f16();this.PC=this.r16(0,p);cy=5;break;} // JMP (abs)
+      case 0x7C:{const p=(this.f16()+this.X)&0xFFFF;this.PC=this.r16(this.PBR,p);cy=6;break;} // JMP (abs,X)
+      case 0xDC:{const p=this.f16();const a=this.r24(0,p);this.PBR=(a>>16)&0xFF;this.PC=a&0xFFFF;cy=6;break;} // JML [abs]
+
+      // ──── JSR / JSL ───────────────────────────────────────────────────────
+      case 0x20:{const t=this.f16();this.ph16((this.PC-1)&0xFFFF);this.PC=t;cy=6;break;} // JSR
+      case 0x22:{const t=this.f24();this.ph8(this.PBR);this.ph16((this.PC-1)&0xFFFF);this.PBR=(t>>16)&0xFF;this.PC=t&0xFFFF;cy=8;break;} // JSL
+      case 0xFC:{const p=(this.f16()+this.X)&0xFFFF;this.ph16((this.PC-1)&0xFFFF);this.PC=this.r16(this.PBR,p);cy=8;break;} // JSR (abs,X)
+
+      // ──── RTS / RTL / RTI ────────────────────────────────────────────────
+      case 0x60:{this.PC=(this.pl16()+1)&0xFFFF;cy=6;break;} // RTS
+      case 0x6B:{const pc=this.pl16();this.PBR=this.pl8();this.PC=(pc+1)&0xFFFF;cy=6;break;} // RTL
+      case 0x40:{ // RTI
+        this.P=this.pl8(); if(this.E)this.P|=0x30; else if(this.fX){this.X&=0xFF;this.Y&=0xFF;}
+        this.PC=this.pl16(); if(!this.E)this.PBR=this.pl8(); cy=6;break;
+      }
+
+      // ──── BRK / COP ───────────────────────────────────────────────────────
+      case 0x00:{ // BRK
+        this.f8(); if(!this.E)this.ph8(this.PBR); this.ph16(this.PC); this.ph8(this.E?this.P|0x30:this.P|0x10);
+        this.sI(true);this.sD(false);this.PBR=0;
+        this.PC=this.r16(0,this.E?0xFFFE:0xFFE6);cy=8;break;
+      }
+      case 0x02:{ // COP
+        this.f8(); if(!this.E)this.ph8(this.PBR); this.ph16(this.PC); this.ph8(this.E?this.P|0x30:this.P);
+        this.sI(true);this.sD(false);this.PBR=0;
+        this.PC=this.r16(0,this.E?0xFFF4:0xFFE4);cy=8;break;
+      }
+
+      // ──── Branches ────────────────────────────────────────────────────────
+      case 0x90:cy=this._branch(!this.fC);break; // BCC
+      case 0xB0:cy=this._branch( this.fC);break; // BCS
+      case 0xF0:cy=this._branch( this.fZ);break; // BEQ
+      case 0x30:cy=this._branch( this.fN);break; // BMI
+      case 0xD0:cy=this._branch(!this.fZ);break; // BNE
+      case 0x10:cy=this._branch(!this.fN);break; // BPL
+      case 0x50:cy=this._branch(!this.fV);break; // BVC
+      case 0x70:cy=this._branch( this.fV);break; // BVS
+      case 0x80:cy=this._branch(true);break;      // BRA
+      case 0x82:{const o=this.f16();this.PC=(this.PC+(o<0x8000?o:o-0x10000))&0xFFFF;cy=4;break;} // BRL
+
+      // ──── Flag / REP / SEP / XCE ─────────────────────────────────────────
+      case 0x18:this.sC(false);break; // CLC
+      case 0x38:this.sC(true); break; // SEC
+      case 0x58:this.sI(false);break; // CLI
+      case 0x78:this.sI(true); break; // SEI
+      case 0xD8:this.sD(false);break; // CLD
+      case 0xF8:this.sD(true); break; // SED
+      case 0xB8:this.sV(false);break; // CLV
+      case 0xC2:{ // REP #imm — clear bits
+        const m=this.f8(); this.P&=~m; if(this.E)this.P|=0x30; if(this.fX){this.X&=0xFF;this.Y&=0xFF;} cy=3;break;
+      }
+      case 0xE2:{ // SEP #imm — set bits
+        const m=this.f8(); this.P|=m; if(this.fX){this.X&=0xFF;this.Y&=0xFF;} cy=3;break;
+      }
+      case 0xFB:{ // XCE — exchange carry ↔ emulation
+        const oe=this.E,oc=this.fC; this.E=oc; this.sC(oe);
+        if(this.E){this.P|=0x30;this.SP=0x100|(this.SP&0xFF);this.X&=0xFF;this.Y&=0xFF;}
+        cy=2;break;
+      }
+
+      // ──── Block moves ─────────────────────────────────────────────────────
+      case 0x54:{ // MVN: increment
+        const dst=this.f8(),src=this.f8(); this.DBR=dst;
+        this.wr((dst<<16)|(this.Y&0xFFFF),this.rd((src<<16)|(this.X&0xFFFF)));
+        this.X=(this.X+1)&(this.fX?0xFF:0xFFFF); this.Y=(this.Y+1)&(this.fX?0xFF:0xFFFF);
+        this.A=(this.A-1)&0xFFFF; if(this.A!==0xFFFF)this.PC=(this.PC-3)&0xFFFF; cy=7;break;
+      }
+      case 0x44:{ // MVP: decrement
+        const dst=this.f8(),src=this.f8(); this.DBR=dst;
+        this.wr((dst<<16)|(this.Y&0xFFFF),this.rd((src<<16)|(this.X&0xFFFF)));
+        this.X=(this.X-1)&(this.fX?0xFF:0xFFFF); this.Y=(this.Y-1)&(this.fX?0xFF:0xFFFF);
+        this.A=(this.A-1)&0xFFFF; if(this.A!==0xFFFF)this.PC=(this.PC-3)&0xFFFF; cy=7;break;
+      }
+
+      // ──── Misc ────────────────────────────────────────────────────────────
+      case 0xEA:cy=2;break;  // NOP
+      case 0x42:this.f8();cy=2;break;  // WDM (2-byte NOP)
+      case 0xCB:this.waiting=true;cy=3;break;  // WAI
+      case 0xDB:this.stopped=true;cy=3;break;  // STP
+
+      default:cy=2;break; // unknown opcode — 2-cycle NOP
+    }
+    // Record unique PC transitions for diagnostics (max 24 entries)
+    const fullPc = (this.PBR << 16) | this.PC;
+    if (fullPc !== this._lastTracePc) {
+      this._lastTracePc = fullPc;
+      this.pcHistory.push(fullPc);
+      if (this.pcHistory.length > 24) this.pcHistory.shift();
+    }
+    this.cycles+=cy;
+    return cy;
+  }
+
+  snapshot() {
+    return { pc:this.PC, a:this.A, x:this.X, y:this.Y,
+             sp:this.SP, dp:this.DP, pbr:this.PBR, dbr:this.DBR,
+             p:this.P, e:this.E, cycles:this.cycles };
+  }
+}
+
+// ── PPU (Picture Processing Unit) ────────────────────────────────────────────
+// Full scanline renderer: BG modes 0-3 + Mode 7, 128 sprites (all OBSEL sizes),
+// correct per-mode priority tables, brightness, VRAM/OAM/CGRAM port logic,
+// NMI trigger at VBlank line 224.
+class PPU {
+  constructor() {
+    this.vram  = new Uint8Array(0x10000);  // 64 KB, byte-indexed
+    this.cgram = new Uint16Array(0x100);   // 256 × 15-bit BGR555
+    this.oam   = new Uint8Array(0x220);    // 544 OAM bytes
+    this.regs  = new Uint8Array(0x40);     // shadow $2100–$213F
+    // Real SNES power-on state: INIDISP ($2100) = $8F (forced blank active, brightness=15).
+    // Without this, brightness=0 and every scanline renders pitch black until the game
+    // writes to $2100, making it impossible to tell if the emulator is running or dead.
+    this.regs[0x00] = 0x8F;
+
+    // Timing — master-clock based (1364 clocks per scanline)
+    this.clk=0; this.scanline=0; this.vblank=false; this.hblank=false; this.frame=0;
+    this.bus=null; // wired by SNES constructor
+
+    // VRAM port
+    this.vramAddr=0; this.vramInc=1; this.vramIncOnHi=false; this.vramRdBuf=0;
+
+    // CGRAM port
+    this.cgramAddr=0; this.cgramBuf=0; this.cgramLatch=false;
+
+    // OAM port
+    this.oamByteAddr=0; this.oamLow=0;
+
+    // BG scroll latches (10-bit per axis)
+    this.bgH=[0,0,0,0]; this.bgV=[0,0,0,0];
+    this.m7prev=0;  // BG1 / Mode-7 matrix shared latch
+    this.bgPrev=0;  // BG2–4 scroll latch
+
+    // Mode 7 affine matrix (16-bit signed fixed-point, 8 frac bits)
+    this.m7a=0x0100; this.m7b=0; this.m7c=0; this.m7d=0x0100;
+    this.m7cx=0; this.m7cy=0;
+
+    // Fixed colour for colour math ($2132 COLDATA)
+    this.fixedColor=0;
+
+    this.pixels = new Uint32Array(W*H);
+    this.pixels.fill(0xFF1A1428);
+  }
+
+  // ── 15-bit BGR555 → 32-bit RGBA for putImageData (little-endian: 0xAABBGGRR) ─
+  _c(c15) {
+    const r=((c15&0x1F)*255/31+0.5)|0;
+    const g=(((c15>>5)&0x1F)*255/31+0.5)|0;
+    const b=(((c15>>10)&0x1F)*255/31+0.5)|0;
+    return (0xFF000000|0)|(b<<16)|(g<<8)|r;
+  }
+
+  // ── VRAM prefetch (called after vramAddr changes) ────────────────────────────
+  _pfVRAM() {
+    const a=(this.vramAddr<<1)&0xFFFF;
+    this.vramRdBuf=this.vram[a]|(this.vram[a+1]<<8);
+  }
+
+  // ── Register read ($2100–$213F) ──────────────────────────────────────────────
+  regRead(addr) {
+    const r=addr-0x2100;
+    switch(r) {
+      case 0x34: { const p=(this.m7a*(this.m7b>>8))&0xFFFFFF; return p&0xFF; }
+      case 0x35: { const p=(this.m7a*(this.m7b>>8))&0xFFFFFF; return (p>>8)&0xFF; }
+      case 0x36: { const p=(this.m7a*(this.m7b>>8))&0xFFFFFF; return (p>>16)&0xFF; }
+      case 0x38: {
+        const v=this.vramRdBuf&0xFF;
+        if(!this.vramIncOnHi){this.vramAddr=(this.vramAddr+this.vramInc)&0x7FFF;this._pfVRAM();}
+        return v;
+      }
+      case 0x39: {
+        const v=(this.vramRdBuf>>8)&0xFF;
+        if(this.vramIncOnHi){this.vramAddr=(this.vramAddr+this.vramInc)&0x7FFF;this._pfVRAM();}
+        return v;
+      }
+      case 0x3B: { // CGRAM read data
+        let v;
+        if(!this.cgramLatch){ v=this.cgram[this.cgramAddr&0xFF]&0xFF; this.cgramLatch=true; }
+        else{ v=(this.cgram[this.cgramAddr&0xFF]>>8)&0x7F; this.cgramAddr=(this.cgramAddr+1)&0xFF; this.cgramLatch=false; }
+        return v;
+      }
+      case 0x3E: return 0x01; // PPU1 version
+      case 0x3F: return (this.vblank?0x80:0)|0x02; // PPU2 version
+      default:   return this.regs[r]??0;
+    }
+  }
+
+  // ── Register write ($2100–$213F) ─────────────────────────────────────────────
+  regWrite(addr,val) {
+    const r=addr-0x2100;
+    this.regs[r]=val;
+    switch(r) {
+      // OAM address
+      case 0x02: this.oamByteAddr=(((this.regs[0x03]&1)<<8)|val)<<1; break;
+      case 0x03: this.oamByteAddr=(((val&1)<<8)|this.regs[0x02])<<1; break;
+      // OAM data — 2-byte latch for low table, direct for high table
+      case 0x04:
+        if(this.oamByteAddr<0x200){
+          if(this.oamByteAddr&1){
+            this.oam[this.oamByteAddr^1]=this.oamLow;
+            this.oam[this.oamByteAddr]=val;
+          } else { this.oamLow=val; }
+        } else if(this.oamByteAddr<0x220){ this.oam[this.oamByteAddr]=val; }
+        this.oamByteAddr=(this.oamByteAddr+1)&0x3FF;
+        break;
+      // BG scroll — two-write latches (real SNES: scroll = (cur<<8|prev) & 0x3FF)
+      case 0x0D: this.bgH[0]=((val<<8)|this.m7prev)&0x3FF; this.m7prev=val; break;
+      case 0x0E: this.bgV[0]=((val<<8)|this.m7prev)&0x3FF; this.m7prev=val; break;
+      case 0x0F: this.bgH[1]=((val<<8)|this.bgPrev)&0x3FF; this.bgPrev=val; break;
+      case 0x10: this.bgV[1]=((val<<8)|this.bgPrev)&0x3FF; this.bgPrev=val; break;
+      case 0x11: this.bgH[2]=((val<<8)|this.bgPrev)&0x3FF; this.bgPrev=val; break;
+      case 0x12: this.bgV[2]=((val<<8)|this.bgPrev)&0x3FF; this.bgPrev=val; break;
+      case 0x13: this.bgH[3]=((val<<8)|this.bgPrev)&0x3FF; this.bgPrev=val; break;
+      case 0x14: this.bgV[3]=((val<<8)|this.bgPrev)&0x3FF; this.bgPrev=val; break;
+      // VRAM port
+      case 0x15:
+        this.vramInc=[1,32,128,128][val&3];
+        this.vramIncOnHi=!!(val&0x80);
+        break;
+      case 0x16: this.vramAddr=(this.vramAddr&0x7F00)|val; this._pfVRAM(); break;
+      case 0x17: this.vramAddr=(this.vramAddr&0x00FF)|((val&0x7F)<<8); this._pfVRAM(); break;
+      case 0x18:
+        this.vram[(this.vramAddr<<1)&0xFFFF]=val;
+        if(!this.vramIncOnHi){this.vramAddr=(this.vramAddr+this.vramInc)&0x7FFF;this._pfVRAM();}
+        break;
+      case 0x19:
+        this.vram[((this.vramAddr<<1)+1)&0xFFFF]=val;
+        if(this.vramIncOnHi){this.vramAddr=(this.vramAddr+this.vramInc)&0x7FFF;this._pfVRAM();}
+        break;
+      // Mode 7 matrix (two-write signed 16-bit latch, shared with BG1 scroll)
+      case 0x1B: this.m7a=(val<<8)|this.m7prev; this.m7prev=val; break;
+      case 0x1C: this.m7b=(val<<8)|this.m7prev; this.m7prev=val; break;
+      case 0x1D: this.m7c=(val<<8)|this.m7prev; this.m7prev=val; break;
+      case 0x1E: this.m7d=(val<<8)|this.m7prev; this.m7prev=val; break;
+      case 0x1F: this.m7cx=(val<<8)|this.m7prev; this.m7prev=val; break;
+      case 0x20: this.m7cy=(val<<8)|this.m7prev; this.m7prev=val; break;
+      // CGRAM
+      case 0x21: this.cgramAddr=val; this.cgramLatch=false; break;
+      case 0x22:
+        if(!this.cgramLatch){ this.cgramBuf=val; this.cgramLatch=true; }
+        else{
+          this.cgram[this.cgramAddr&0xFF]=((val&0x7F)<<8)|this.cgramBuf;
+          this.cgramAddr=(this.cgramAddr+1)&0xFF;
+          this.cgramLatch=false;
+        }
+        break;
+      // Fixed colour ($2132 COLDATA)
+      case 0x32: {
+        const i=val&0x1F;
+        if(val&0x20) this.fixedColor=(this.fixedColor&~0x001F)|i;
+        if(val&0x40) this.fixedColor=(this.fixedColor&~0x03E0)|(i<<5);
+        if(val&0x80) this.fixedColor=(this.fixedColor&~0x7C00)|(i<<10);
+        break;
+      }
+    }
+  }
+
+  // ── BG scanline (returns Array[256] of {cgi,prio} | null) ───────────────────
+  _bgLine(bg, y, bpp) {
+    // Mosaic: $2106 — bits 7-4=size(0-15), bits 3-0=BG enable
+    const mosaic = this.regs[0x06];
+    const mSize  = ((mosaic >> 4) & 0xF) + 1; // 1=off, 2-16=pixel repeat
+    const mEn    = !!(mosaic & (1 << bg));
+    // Snap y to mosaic row start
+    const mY = mEn && mSize > 1 ? y - (y % mSize) : y;
+
+    const bgSC    = this.regs[0x07+bg];
+    const mapBase = ((bgSC>>2)&0x3F)<<10;             // word address
+    const mapSzX  = (bgSC&1)?64:32;
+    const mapSzY  = (bgSC&2)?64:32;
+    const nba     = this.regs[0x0B+(bg>>1)];
+    const charBase= ((bg&1)?(nba>>4):(nba&0xF))<<12;  // word address (×0x1000)
+    const wpt     = bpp===2?8:bpp===4?16:32;           // words per tile
+    const effY    = (mY+this.bgV[bg])&((mapSzY<<3)-1); // use mosaic-snapped row
+    const tileRow = effY>>3;
+    const pxRow   = effY&7;
+    const pgsW    = mapSzX===64?2:1;
+    const mode    = this.regs[0x05]&7;
+
+    const out=new Array(256);
+    let lastTC=-1, p0=0,p1=0,p2=0,p3=0,p4=0,p5=0,p6=0,p7=0;
+    let palette=0,prio=0,xflip=0;
+
+    for(let x=0;x<256;x++){
+      // Mosaic x-snapping
+      const mx = mEn && mSize > 1 ? x - (x % mSize) : x;
+      const effX=(mx+this.bgH[bg])&((mapSzX<<3)-1);
+      const tc=effX>>3;
+      const pc=effX&7;
+
+      if(tc!==lastTC){
+        lastTC=tc;
+        const pgX=(tc>>5)&1, pgY=(tileRow>>5)&1;
+        const page=pgY*pgsW+pgX;
+        const ma=mapBase+page*0x400+((tileRow&31)<<5)+(tc&31);
+        const lo=this.vram[(ma<<1)&0xFFFF], hi=this.vram[((ma<<1)+1)&0xFFFF];
+        const e=(hi<<8)|lo;
+        const tileNo=e&0x3FF;
+        palette=(e>>10)&7; prio=(e>>13)&1; xflip=(e>>14)&1;
+        const yflip=(e>>15)&1;
+        const row=yflip?7-pxRow:pxRow;
+        const wa=(charBase+tileNo*wpt+row)&0x7FFF;
+        p0=this.vram[(wa<<1)&0xFFFF]; p1=this.vram[((wa<<1)+1)&0xFFFF];
+        if(bpp>=4){
+          p2=this.vram[((wa+8)<<1)&0xFFFF]; p3=this.vram[(((wa+8)<<1)+1)&0xFFFF];
+        }
+        if(bpp===8){
+          p4=this.vram[((wa+16)<<1)&0xFFFF]; p5=this.vram[(((wa+16)<<1)+1)&0xFFFF];
+          p6=this.vram[((wa+24)<<1)&0xFFFF]; p7=this.vram[(((wa+24)<<1)+1)&0xFFFF];
+        }
+      }
+
+      const col=xflip?7-pc:pc, bit=7-col;
+      let ci;
+      if(bpp===2)      ci=((p0>>bit)&1)|(((p1>>bit)&1)<<1);
+      else if(bpp===4) ci=((p0>>bit)&1)|(((p1>>bit)&1)<<1)|(((p2>>bit)&1)<<2)|(((p3>>bit)&1)<<3);
+      else             ci=((p0>>bit)&1)|(((p1>>bit)&1)<<1)|(((p2>>bit)&1)<<2)|(((p3>>bit)&1)<<3)|
+                          (((p4>>bit)&1)<<4)|(((p5>>bit)&1)<<5)|(((p6>>bit)&1)<<6)|(((p7>>bit)&1)<<7);
+
+      if(ci===0){out[x]=null;continue;}
+
+      let cgi;
+      if(mode===0)     cgi=bg*32+palette*4+ci;
+      else if(bpp===8) cgi=ci;
+      else             cgi=palette*(1<<bpp)+ci;
+      out[x]={cgi:cgi&0xFF,prio};
+    }
+    return out;
+  }
+
+  // ── Mode 7 scanline (affine, returns Array[256] of {cgi,prio} | null) ───────
+  _m7Line(y) {
+    const out=new Array(256);
+    const sel=this.regs[0x1A];
+    // sign-extend 13-bit scroll and 16-bit matrix values
+    const sx=(this.bgH[0]<<19)>>19, sy=(this.bgV[0]<<19)>>19;
+    const cx=(this.m7cx<<16)>>16,   cy=(this.m7cy<<16)>>16;
+    const a=(this.m7a<<16)>>16,     b=(this.m7b<<16)>>16;
+    const c=(this.m7c<<16)>>16,     d=(this.m7d<<16)>>16;
+    const ry=y+sy-cy;
+    for(let x=0;x<256;x++){
+      const rx=x+sx-cx;
+      let tx=((a*rx+b*ry)>>8)+cx;
+      let ty=((c*rx+d*ry)>>8)+cy;
+      if(tx<0||tx>1023||ty<0||ty>1023){
+        if(sel&0x80){
+          if(sel&0x40){out[x]=null;continue;}
+          out[x]={cgi:0,prio:0};continue;
+        }
+        tx&=1023; ty&=1023;
+      }
+      const mapAddr=((ty>>3)&0x7F)*128+((tx>>3)&0x7F);
+      const tileNo=this.vram[(mapAddr<<1)&0xFFFF];
+      const charAddr=(tileNo*64+((ty&7)<<3)+(tx&7))&0x7FFF;
+      const ci=this.vram[((charAddr<<1)+1)&0xFFFF];
+      out[x]=ci===0?null:{cgi:ci,prio:0};
+    }
+    return out;
+  }
+
+  // ── Sprite scanline (returns Array[256] of {cgi,prio} | null) ───────────────
+  _sprLine(y) {
+    const out=new Array(256).fill(null);
+    const obsel=this.regs[0x01];
+    // sprite sizes [smallW,smallH,largeW,largeH] indexed by OBSEL bits 2-0
+    const SZ=[[8,8,16,16],[8,8,32,32],[8,8,64,64],[16,16,32,32],[16,16,64,64],[32,32,64,64],[16,32,32,64],[16,32,32,64]];
+    const sz=SZ[obsel&7];
+    // name table word-address bases
+    const nb0=((obsel>>3)&3)*0x1000;
+    const nb1=nb0+((((obsel>>5)&7)+1)<<11);  // +gap×0x800 words
+    let count=0;
+
+    for(let s=0;s<128;s++){
+      const o4=s<<2;
+      const eb=(this.oam[0x200+(s>>2)]>>((s&3)<<1))&3;
+      const large=(eb>>1)&1;
+      const spW=large?sz[2]:sz[0], spH=large?sz[3]:sz[1];
+      const yPos=this.oam[o4+1];
+      const row=(y-yPos)&0xFF;
+      if(row>=spH) continue;
+      if(count>=32) break;
+      count++;
+
+      const xLo=this.oam[o4];
+      const xPos=(eb&1)?xLo-256:xLo;
+      if(xPos+spW<=0||xPos>=W) continue;
+
+      const tileNo=this.oam[o4+2];
+      const attr=this.oam[o4+3];
+      const nameT= attr&1;
+      const pal  =(attr>>1)&7;
+      const prio =(attr>>4)&3;
+      const hflip=(attr>>6)&1;
+      const vflip=(attr>>7)&1;
+
+      const chrBase=nameT?nb1:nb0;
+      const sprRow=vflip?spH-1-row:row;
+
+      for(let px=0;px<spW;px++){
+        const sx=xPos+px;
+        if(sx<0||sx>=W||out[sx]) continue;
+        const col=hflip?spW-1-px:px;
+        const stX=(col>>3)&0xF, stY=(sprRow>>3)&0xF;
+        const ptX=col&7,        ptY=sprRow&7;
+        // subtile within the 16×16 sprite tile grid
+        const sub=((((tileNo>>4)+stY)&0xF)<<4)|((tileNo+stX)&0xF);
+        const wa=(chrBase+(sub&0xFF)*16+ptY)&0x7FFF;
+        const p0=this.vram[(wa<<1)&0xFFFF];
+        const p1=this.vram[((wa<<1)+1)&0xFFFF];
+        const p2=this.vram[((wa+8)<<1)&0xFFFF];
+        const p3=this.vram[(((wa+8)<<1)+1)&0xFFFF];
+        const bit=7-ptX;
+        const ci=((p0>>bit)&1)|(((p1>>bit)&1)<<1)|(((p2>>bit)&1)<<2)|(((p3>>bit)&1)<<3);
+        if(ci===0) continue;
+        out[sx]={cgi:(128+pal*16+ci)&0xFF,prio};
+      }
+    }
+    return out;
+  }
+
+  // ── Priority layer tables ────────────────────────────────────────────────────
+  // Each entry: [0=BG|1=SPR, bg_index_or_ignored, tile_prio_or_spr_prio]
+  _layers(mode) {
+    const bg3hi=!!(this.regs[0x05]&8);
+    if(mode===0) return [
+      [1,0,3],[0,0,1],[0,1,1],[1,0,2],[0,0,0],[0,1,0],
+      [1,0,1],[0,2,1],[0,3,1],[1,0,0],[0,2,0],[0,3,0]
+    ];
+    if(mode===1&&bg3hi) return [
+      [0,2,1],[1,0,3],[0,0,1],[0,1,1],[1,0,2],[0,0,0],[0,1,0],[1,0,1],[1,0,0],[0,2,0]
+    ];
+    if(mode===1) return [
+      [1,0,3],[0,0,1],[0,1,1],[1,0,2],[0,0,0],[0,1,0],[1,0,1],[0,2,1],[1,0,0],[0,2,0]
+    ];
+    // Modes 2-6: BG1/BG2, sprites on top
+    return [
+      [1,0,3],[0,0,1],[1,0,2],[0,1,1],[1,0,1],[0,0,0],[1,0,0],[0,1,0]
+    ];
+  }
+
+  // ── Window mask: returns true if pixel x is INSIDE window n (0=W1,1=W2) ───────
+  _winIn(n, x) {
+    // WH0=$2126 left1, WH1=$2127 right1, WH2=$2128 left2, WH3=$2129 right2
+    const l = this.regs[0x26 + n*2];
+    const r = this.regs[0x27 + n*2];
+    return x >= l && x <= r;
+  }
+
+  // ── Build per-layer window mask for one scanline ─────────────────────────────
+  // Returns Uint8Array[256]: 0 = masked out, 1 = visible
+  // layer: 0-3 = BG1-4, 4 = OBJ, 5 = color-math window
+  _buildWinMask(layer) {
+    // $2123 W12SEL BG1/BG2, $2124 W34SEL BG3/BG4, $2125 WOBJSEL OBJ/CM
+    // Each layer has 4 bits: W1en W1inv W2en W2inv
+    let cfgReg, shift;
+    if (layer <= 1)      { cfgReg = this.regs[0x23]; shift = layer * 4; }
+    else if (layer <= 3) { cfgReg = this.regs[0x24]; shift = (layer-2) * 4; }
+    else                 { cfgReg = this.regs[0x25]; shift = (layer-4) * 4; }
+    const cfg = (cfgReg >> shift) & 0xF;
+
+    const w1en  = !!(cfg & 0x2), w1inv = !!(cfg & 0x1);
+    const w2en  = !!(cfg & 0x8), w2inv = !!(cfg & 0x4);
+
+    // $2126/$2127 = W1 left/right, $2128/$2129 = W2 left/right
+    const w1l = this.regs[0x26], w1r = this.regs[0x27];
+    const w2l = this.regs[0x28], w2r = this.regs[0x29];
+
+    // $212A WBGLOG (BG1-4), $212B WOBJLOG (OBJ/CM) — 2 bits per layer: 00=OR 01=AND 10=XOR 11=XNOR
+    let logReg, logShift;
+    if (layer <= 3) { logReg = this.regs[0x2A]; logShift = layer * 2; }
+    else            { logReg = this.regs[0x2B]; logShift = (layer-4) * 2; }
+    const logOp = (logReg >> logShift) & 0x3;
+
+    const mask = new Uint8Array(256);
+    for (let x = 0; x < 256; x++) {
+      const in1 = w1en ? ((x >= w1l && x <= w1r) !== w1inv) : false;
+      const in2 = w2en ? ((x >= w2l && x <= w2r) !== w2inv) : false;
+      if (!w1en && !w2en) { mask[x] = 1; continue; }
+      if (w1en && !w2en)  { mask[x] = in1 ? 1 : 0; continue; }
+      if (!w1en && w2en)  { mask[x] = in2 ? 1 : 0; continue; }
+      // Both windows active — combine with log op
+      let v;
+      switch (logOp) {
+        case 0: v = in1 || in2;  break; // OR
+        case 1: v = in1 && in2;  break; // AND
+        case 2: v = in1 !== in2; break; // XOR
+        case 3: v = in1 === in2; break; // XNOR
+        default: v = false;
+      }
+      mask[x] = v ? 1 : 0;
+    }
+    return mask;
+  }
+
+  // ── Blend two BGR555 colours for colour math ─────────────────────────────────
+  // op: 0=add, 1=sub; half: halve result
+  _blendC(main, sub, op, half) {
+    let r = (main & 0x1F);
+    let g = ((main >> 5) & 0x1F);
+    let b = ((main >> 10) & 0x1F);
+    const sr = (sub & 0x1F);
+    const sg = ((sub >> 5) & 0x1F);
+    const sb = ((sub >> 10) & 0x1F);
+    if (op === 0) { r+=sr; g+=sg; b+=sb; }
+    else          { r-=sr; g-=sg; b-=sb; }
+    if (half) { r>>=1; g>>=1; b>>=1; }
+    r = Math.max(0, Math.min(31, r));
+    g = Math.max(0, Math.min(31, g));
+    b = Math.max(0, Math.min(31, b));
+    return r | (g<<5) | (b<<10);
+  }
+
+  // ── Render one scanline into this.pixels ─────────────────────────────────────
+  _renderScanline(y) {
+    const base=y*W;
+    const inidisp=this.regs[0x00];
+    // Force blank → black
+    if(inidisp&0x80){ this.pixels.fill(0xFF000000,base,base+W); return; }
+
+    const brightness=inidisp&0xF;
+    const tm  = this.regs[0x2C]; // main screen layers
+    const ts  = this.regs[0x2D]; // sub screen layers
+    const mode= this.regs[0x05]&7;
+    const bppT=[[2,2,2,2],[4,4,2,0],[4,4,0,0],[8,4,0,0],[8,2,0,0],[4,2,0,0],[4,0,0,0],[0,0,0,0]];
+
+    // $2130 CGWSEL: bit1=sub-backdrop (0=CGRAM[0],1=fixed), bit0=direct-color(mode7)
+    // bit4-5: force colour math (0=always,1=in-window,2=out-of-window,3=never)
+    const cgwsel  = this.regs[0x30];
+    // $2131 CGADSUB: bit7=0→add/1→sub, bit6=half, bits5-0=layer enables (BG1-4,OBJ,BD)
+    const cgadsub = this.regs[0x31];
+    const cmAdd   = !(cgadsub & 0x80);          // 0=add, 1=sub
+    const cmHalf  = !!(cgadsub & 0x40);
+    const cmEn    = cgadsub & 0x3F;             // which layers do colour math
+    const cmForce = (cgwsel >> 4) & 0x3;        // 0=always,1=in-win,2=out-win,3=never
+
+    // Check whether any windowing is actually configured to save work
+    const anyWin = (this.regs[0x23]|this.regs[0x24]|this.regs[0x25]) !== 0;
+
+    // Build window masks only when needed
+    let winMain = null, winSub = null, winCM = null;
+    // TM/TS window enable: $212E main clip, $212F sub clip
+    const tmWin = this.regs[0x2E]; // which main layers are window-clipped
+    const tsWin = this.regs[0x2F]; // which sub layers are window-clipped
+    const needWin = anyWin && (tmWin || tsWin || cmEn);
+
+    // Per-layer window masks (lazy, only built when that layer uses windowing)
+    const layerWin = [null, null, null, null, null, null]; // BG0-3, OBJ, CM
+
+    const getWin = (li) => {
+      if (!layerWin[li]) layerWin[li] = this._buildWinMask(li);
+      return layerWin[li];
+    };
+
+    // Build per-layer scanlines
+    let bgL=[null,null,null,null], sprL=null;
+    if(mode===7){ if(tm&1) bgL[0]=this._m7Line(y); }
+    else{
+      for(let bg=0;bg<4;bg++){
+        const bpp=bppT[mode][bg];
+        if(bpp&&((tm|ts)>>bg)&1) bgL[bg]=this._bgLine(bg,y,bpp);
+      }
+    }
+    if((tm|ts)&0x10) sprL=this._sprLine(y);
+
+    const layers=this._layers(mode);
+
+    // Sub-screen backdrop colour
+    const subBD = (cgwsel & 0x02) ? this.fixedColor : this.cgram[0];
+
+    for(let x=0;x<W;x++){
+      // ── Main screen ──────────────────────────────────────────────────────────
+      let mainCGI=0, mainLayer=-1; // -1=backdrop
+      outer:
+      for(let li=0;li<layers.length;li++){
+        const layer=layers[li];
+        const lIdx = layer[0]===1 ? 4 : layer[1]; // 0-3=BG, 4=OBJ
+        // Check main-screen enable bit
+        const tmBit = layer[0]===1 ? 0x10 : (1<<layer[1]);
+        if(!(tm & tmBit)) continue;
+        // Window clipping for main screen
+        if(needWin && (tmWin & tmBit)) {
+          const wm = getWin(lIdx);
+          if(!wm[x]) continue; // clipped out
+        }
+        if(layer[0]===1){ // sprite
+          if(!sprL) continue;
+          const sp=sprL[x];
+          if(sp&&sp.prio===layer[2]){mainCGI=sp.cgi; mainLayer=4; break outer;}
+        } else {
+          const bg=layer[1];
+          if(!bgL[bg]) continue;
+          const px=bgL[bg][x];
+          if(px&&px.prio===layer[2]){mainCGI=px.cgi; mainLayer=bg; break outer;}
+        }
+      }
+
+      // ── Sub screen (for colour math) ─────────────────────────────────────────
+      let subC15 = subBD;
+      let subLayer = -1;
+      if(cmEn) {
+        outer2:
+        for(let li=0;li<layers.length;li++){
+          const layer=layers[li];
+          const tsBit = layer[0]===1 ? 0x10 : (1<<layer[1]);
+          if(!(ts & tsBit)) continue;
+          const lIdx = layer[0]===1 ? 4 : layer[1];
+          if(needWin && (tsWin & tsBit)) {
+            const wm = getWin(lIdx);
+            if(!wm[x]) continue;
+          }
+          if(layer[0]===1){
+            if(!sprL) continue;
+            const sp=sprL[x];
+            if(sp&&sp.prio===layer[2]){subC15=this.cgram[sp.cgi]; subLayer=4; break outer2;}
+          } else {
+            const bg=layer[1];
+            if(!bgL[bg]) continue;
+            const px=bgL[bg][x];
+            if(px&&px.prio===layer[2]){subC15=this.cgram[px.cgi]; subLayer=bg; break outer2;}
+          }
+        }
+      }
+
+      // ── Colour math ──────────────────────────────────────────────────────────
+      let c15 = this.cgram[mainCGI];
+
+      // Determine if colour math applies at this pixel
+      // cmForce: 0=always, 1=inside CM window, 2=outside CM window, 3=never
+      let doCM = false;
+      if(cmForce !== 3 && cmEn) {
+        // Which layer bit applies (BD=bit5, OBJ=bit4, BG4-1=bits3-0)
+        const lbit = mainLayer === -1 ? 0x20 : mainLayer === 4 ? 0x10 : (1 << mainLayer);
+        if(cmEn & lbit) {
+          if(cmForce === 0) {
+            doCM = true;
+          } else {
+            const cwm = getWin(5);
+            if(cmForce === 1) doCM =  !!cwm[x];
+            else              doCM = !cwm[x];
+          }
+        }
+      }
+
+      if(doCM) {
+        c15 = this._blendC(c15, subC15, cmAdd ? 0 : 1, cmHalf);
+      }
+
+      // ── Brightness scaling ────────────────────────────────────────────────────
+      let rgba = this._c(c15);
+      if(brightness<15){
+        const sc=brightness/15;
+        const r=((rgba&0xFF)*sc+0.5)|0;
+        const g=(((rgba>>8)&0xFF)*sc+0.5)|0;
+        const b=(((rgba>>16)&0xFF)*sc+0.5)|0;
+        rgba=(0xFF000000|0)|(b<<16)|(g<<8)|r;
+      }
+      this.pixels[base+x]=rgba;
+    }
+  }
+
+  ppuSnapshot() {
+    return {
+      frame:    this.frame,
+      scanline: this.scanline,
+      vblank:   this.vblank,
+      mode:     this.regs[0x05] & 7,
+      bg3hi:    !!(this.regs[0x05] & 8),
+      tm:       this.regs[0x2C],
+      inidisp:  this.regs[0x00],
+    };
+  }
+
+  // ── Timing advance (master clocks) ───────────────────────────────────────────
+  // Returns true when a full frame (262 scanlines) has been rendered.
+  advance(mc) {
+    this.clk += mc;
+    let done = false;
+    while (this.clk >= LINE_MC) {
+      this.clk -= LINE_MC;
+      const sl = this.scanline;
+      if (sl < H) this._renderScanline(sl);
+      this.scanline++;
+      if (this.scanline === H) {
+        this.vblank = true;
+        if (this.bus) this.bus.triggerNMI();
+      }
+      if (this.scanline >= SCANLINES) {
+        this.scanline = 0; this.vblank = false; this.frame++; done = true;
+      }
+    }
+    this.hblank = this.clk >= HBLANK_MC;
+    return done;
+  }
+}
+
+// ── SPC700 CPU (Sony SNES Sound CPU) ─────────────────────────────────────────
+// 8-bit CPU running at ~1.024 MHz inside the APU module.
+// Has its own 64KB RAM, a built-in 64-byte IPL ROM at $FFC0–$FFFF,
+// a DSP chip at $00F2/$00F3, and 3 hardware timers.
+// Communicates with the main 65816 via 4 bidirectional ports at $00F4–$00F7.
+class SPC700 {
+  constructor() {
+    this.ram    = new Uint8Array(0x10000); // 64KB private RAM
+    // Registers
+    this.A = 0; this.X = 0; this.Y = 0;
+    this.SP = 0xFF;
+    this.PC = 0xFFC0;  // starts in IPL ROM
+    // Processor Status: N V P B H I Z C
+    this.N=0; this.V=0; this.P=0; this.B=0; this.H=0; this.I=0; this.Z=0; this.C=0;
+    // Communication ports (shared with main CPU Bus)
+    // inPorts:  what the 65816 wrote  ($2140–$2143 → SPC reads  $00F4–$00F7)
+    // outPorts: what the SPC700 wrote ($00F4–$00F7 → 65816 reads $2140–$2143)
+    this.inPorts  = new Uint8Array(4);  // written by 65816, read by SPC
+    this.outPorts = new Uint8Array(4);  // written by SPC, read by 65816
+    // Timers (T0/T1 = 8kHz, T2 = 64kHz)
+    this.timerEn     = [false,false,false];
+    this.timerDiv    = [0,0,0];
+    this.timerTarget = [0,0,0];
+    this.timerOut    = [0,0,0];
+    this.timerCycles = [0,0,0];
+    // DSP register file (128 bytes) + address latch
+    this.dspRegs  = new Uint8Array(128);
+    this.dspAddr  = 0;
+    // Control register ($00F1)
+    this.ctrlReg  = 0xB0; // IPL ROM mapped in by default
+    // Cycle accumulator for sub-stepping
+    this.cycles   = 0;
+    // IPL ROM — 64 bytes, hardcoded from real hardware
+    this.iplRom = new Uint8Array([
+      0xCD,0xEF,0xBD,0xE8,0x00,0xC6,0x1D,0xD0,0xFC,0x8F,0xAA,0xF4,0x8F,0xBB,0xF5,0x78,
+      0xCC,0xF4,0xD0,0xFB,0x2F,0x19,0xEB,0xF4,0xD0,0xFC,0x7E,0xF4,0xD0,0x0B,0xE4,0xF5,
+      0xCB,0xF4,0xD7,0x00,0xFC,0xD0,0xF3,0xAB,0x01,0x10,0xEF,0x7E,0xF4,0x10,0xEB,0xBA,
+      0xF6,0xDA,0x00,0xBA,0xF4,0xC4,0xF4,0xDD,0x5D,0xD0,0xDB,0x1F,0x00,0x00,0xC0,0xFF,
+    ]);
+    // Load IPL ROM into top of RAM
+    for (let i=0; i<64; i++) this.ram[0xFFC0+i] = this.iplRom[i];
+    // Reset vector from IPL: $FFFE/$FFFF = $FFC0
+    this.ram[0xFFFE] = 0xC0; this.ram[0xFFFF] = 0xFF;
+    this.PC = (this.ram[0xFFFF]<<8)|this.ram[0xFFFE];
+  }
+
+  // ── Memory access ─────────────────────────────────────────────────────────
+  rd(addr) {
+    addr &= 0xFFFF;
+    // IPL ROM mapped at $FFC0–$FFFF when ctrlReg bit 7 set
+    if (addr >= 0xFFC0 && (this.ctrlReg & 0x80)) return this.iplRom[addr - 0xFFC0];
+    // I/O registers $00F0–$00FF
+    if (addr >= 0x00F0 && addr <= 0x00FF) return this._ioRead(addr);
+    return this.ram[addr];
+  }
+
+  wr(addr, val) {
+    addr &= 0xFFFF; val &= 0xFF;
+    // IPL ROM is read-only
+    if (addr >= 0xFFC0 && (this.ctrlReg & 0x80)) return;
+    if (addr >= 0x00F0 && addr <= 0x00FF) { this._ioWrite(addr, val); return; }
+    this.ram[addr] = val;
+  }
+
+  // ── I/O register read ($00F0–$00FF) ───────────────────────────────────────
+  _ioRead(addr) {
+    switch(addr) {
+      case 0x00F2: return this.dspAddr;
+      case 0x00F3: return this.dspRegs[this.dspAddr & 0x7F];
+      case 0x00F4: return this.inPorts[0];
+      case 0x00F5: return this.inPorts[1];
+      case 0x00F6: return this.inPorts[2];
+      case 0x00F7: return this.inPorts[3];
+      case 0x00F8: return this.ram[0x00F8];
+      case 0x00F9: return this.ram[0x00F9];
+      case 0x00FD: return this._readTimer(0);
+      case 0x00FE: return this._readTimer(1);
+      case 0x00FF: return this._readTimer(2);
+      default: return 0;
+    }
+  }
+
+  // ── I/O register write ($00F0–$00FF) ──────────────────────────────────────
+  _ioWrite(addr, val) {
+    switch(addr) {
+      case 0x00F1: // CONTROL
+        this.ctrlReg = val;
+        for (let i=0;i<3;i++) {
+          const wasEn = this.timerEn[i];
+          this.timerEn[i] = !!(val & (1<<i));
+          if (!wasEn && this.timerEn[i]) {
+            // Timer just enabled — reset counter and output
+            this.timerDiv[i] = 0; this.timerOut[i] = 0; this.timerCycles[i] = 0;
+          }
+        }
+        // Bits 4-5: clear in-ports
+        if (val & 0x10) { this.inPorts[0]=0; this.inPorts[1]=0; }
+        if (val & 0x20) { this.inPorts[2]=0; this.inPorts[3]=0; }
+        break;
+      case 0x00F2: this.dspAddr = val; break;
+      case 0x00F3: if(!(this.dspAddr&0x80)) this.dspRegs[this.dspAddr&0x7F]=val; break;
+      case 0x00F4: this.outPorts[0]=val; break;
+      case 0x00F5: this.outPorts[1]=val; break;
+      case 0x00F6: this.outPorts[2]=val; break;
+      case 0x00F7: this.outPorts[3]=val; break;
+      case 0x00F8: this.ram[0x00F8]=val; break;
+      case 0x00F9: this.ram[0x00F9]=val; break;
+      case 0x00FA: this.timerTarget[0]=val||0x100; break;
+      case 0x00FB: this.timerTarget[1]=val||0x100; break;
+      case 0x00FC: this.timerTarget[2]=val||0x100; break;
+    }
+  }
+
+  _readTimer(n) {
+    const v = this.timerOut[n]; this.timerOut[n]=0; return v & 0x0F;
+  }
+
+  // ── Tick timers (called every SPC cycle) ──────────────────────────────────
+  // T0/T1 increment every 128 cycles (~8kHz), T2 every 16 cycles (~64kHz)
+  _tickTimers() {
+    const thresh = [128,128,16];
+    for (let i=0;i<3;i++) {
+      if (!this.timerEn[i]) continue;
+      this.timerCycles[i]++;
+      if (this.timerCycles[i] >= thresh[i]) {
+        this.timerCycles[i] = 0;
+        this.timerDiv[i] = (this.timerDiv[i]+1) & 0xFF;
+        if (this.timerDiv[i] >= (this.timerTarget[i]||0x100)) {
+          this.timerDiv[i] = 0;
+          this.timerOut[i] = (this.timerOut[i]+1) & 0x0F;
+        }
+      }
+    }
+  }
+
+  // ── Flag helpers ──────────────────────────────────────────────────────────
+  _getP() {
+    return (this.N<<7)|(this.V<<6)|(this.P<<5)|(this.B<<4)|
+           (this.H<<3)|(this.I<<2)|(this.Z<<1)|(this.C);
+  }
+  _setP(v) {
+    this.N=(v>>7)&1; this.V=(v>>6)&1; this.P=(v>>5)&1; this.B=(v>>4)&1;
+    this.H=(v>>3)&1; this.I=(v>>2)&1; this.Z=(v>>1)&1; this.C=v&1;
+  }
+  _sNZ(v) { this.N=!!(v&0x80); this.Z=((v&0xFF)===0); return v&0xFF; }
+  _sNZ16(v){ this.N=!!(v&0x8000);this.Z=((v&0xFFFF)===0);return v&0xFFFF; }
+
+  // ── Stack helpers ─────────────────────────────────────────────────────────
+  _push(v) { this.ram[0x100+this.SP]=v&0xFF; this.SP=(this.SP-1)&0xFF; }
+  _pop()   { this.SP=(this.SP+1)&0xFF; return this.ram[0x100+this.SP]; }
+
+  // ── Addressing modes ──────────────────────────────────────────────────────
+  _dp()     { return (this.P?0x100:0) + this.rd(this.PC++); }  // direct page
+  _dpx()    { const b=this.rd(this.PC++); return ((this.P?0x100:0)+b+this.X)&0xFFFF; }
+  _dpy()    { const b=this.rd(this.PC++); return ((this.P?0x100:0)+b+this.Y)&0xFFFF; }
+  _abs()    { const lo=this.rd(this.PC++),hi=this.rd(this.PC++); return (hi<<8)|lo; }
+  _absx()   { return (this._abs()+this.X)&0xFFFF; }
+  _absy()   { return (this._abs()+this.Y)&0xFFFF; }
+  _idx()    { const b=this.rd(this.PC++); const p=this.P?0x100:0;
+               const ea=(p+b+this.X)&0xFFFF;
+               return (this.rd((ea+1)&0xFFFF)<<8)|this.rd(ea); }
+  _idy()    { const b=this.rd(this.PC++); const p=this.P?0x100:0;
+               const ea=(p+b)&0xFFFF;
+               return (((this.rd((ea+1)&0xFFFF)<<8)|this.rd(ea))+this.Y)&0xFFFF; }
+
+  // ── ADC / SBC helpers ────────────────────────────────────────────────────
+  _adc(a,b){ const r=a+b+this.C; this.C=r>0xFF;
+              this.V=(!!(( a^r)&(b^r)&0x80));
+              this.H=!!((a^b^r)&0x10); return this._sNZ(r); }
+  _sbc(a,b){ return this._adc(a, b^0xFF); }
+
+  // ── ASL/LSR/ROL/ROR ──────────────────────────────────────────────────────
+  _asl(v){ this.C=!!(v&0x80); return this._sNZ((v<<1)&0xFF); }
+  _lsr(v){ this.C=v&1;        return this._sNZ(v>>1); }
+  _rol(v){ const r=((v<<1)|this.C)&0xFF; this.C=!!(v&0x80); return this._sNZ(r); }
+  _ror(v){ const r=((v>>1)|(this.C<<7))&0xFF; this.C=v&1;   return this._sNZ(r); }
+
+  // ── Execute one instruction, return cycle count ───────────────────────────
+  step() {
+    this._tickTimers();
+    const op = this.rd(this.PC++);
+    let cy = 2;
+    switch(op) {
+      // ── MOV immediate → register ─────────────────────────────────────────
+      case 0xE8: this.A=this._sNZ(this.rd(this.PC++)); cy=2; break; // MOV A,#imm
+      case 0xCD: this.X=this._sNZ(this.rd(this.PC++)); cy=2; break; // MOV X,#imm
+      case 0x8D: this.Y=this._sNZ(this.rd(this.PC++)); cy=2; break; // MOV Y,#imm
+
+      // ── MOV register → register ──────────────────────────────────────────
+      case 0x7D: this.A=this._sNZ(this.X); cy=2; break; // MOV A,X
+      case 0xDD: this.A=this._sNZ(this.Y); cy=2; break; // MOV A,Y
+      case 0x5D: this.X=this._sNZ(this.A); cy=2; break; // MOV X,A
+      case 0xFD: this.Y=this._sNZ(this.A); cy=2; break; // MOV Y,A
+      case 0x9D: this.X=this._sNZ(this.SP);cy=2; break; // MOV X,SP
+      case 0xBD: this.SP=this.X; cy=2; break;            // MOV SP,X
+
+      // ── MOV A ← memory ───────────────────────────────────────────────────
+      case 0xE4: this.A=this._sNZ(this.rd(this._dp()));   cy=3; break; // MOV A,dp
+      case 0xF4: this.A=this._sNZ(this.rd(this._dpx()));  cy=4; break; // MOV A,dp+X
+      case 0xE5: this.A=this._sNZ(this.rd(this._abs()));  cy=4; break; // MOV A,abs
+      case 0xF5: this.A=this._sNZ(this.rd(this._absx())); cy=5; break; // MOV A,abs+X
+      case 0xF6: this.A=this._sNZ(this.rd(this._absy())); cy=5; break; // MOV A,abs+Y
+      case 0xE6: this.A=this._sNZ(this.rd(this.X+(this.P?0x100:0))); cy=3; break; // MOV A,(X)
+      case 0xBF: this.A=this._sNZ(this.rd(this.X+(this.P?0x100:0))); this.X=(this.X+1)&0xFF; cy=4; break; // MOV A,(X)+
+      case 0xE7: this.A=this._sNZ(this.rd(this._idx()));  cy=6; break; // MOV A,[dp+X]
+      case 0xF7: this.A=this._sNZ(this.rd(this._idy()));  cy=6; break; // MOV A,[dp]+Y
+
+      // ── MOV X ← memory ───────────────────────────────────────────────────
+      case 0xF8: this.X=this._sNZ(this.rd(this._dp()));   cy=3; break; // MOV X,dp
+      case 0xF9: this.X=this._sNZ(this.rd(this._dpy()));  cy=4; break; // MOV X,dp+Y
+      case 0xE9: this.X=this._sNZ(this.rd(this._abs()));  cy=4; break; // MOV X,abs
+
+      // ── MOV Y ← memory ───────────────────────────────────────────────────
+      case 0xEB: this.Y=this._sNZ(this.rd(this._dp()));   cy=3; break; // MOV Y,dp
+      case 0xFB: this.Y=this._sNZ(this.rd(this._dpy()));  cy=4; break; // MOV Y,dp+Y
+      case 0xEC: this.Y=this._sNZ(this.rd(this._abs()));  cy=4; break; // MOV Y,abs
+
+      // ── MOV memory ← register ────────────────────────────────────────────
+      case 0xC4: this.wr(this._dp(),   this.A); cy=4; break; // MOV dp,A
+      case 0xD4: this.wr(this._dpx(),  this.A); cy=5; break; // MOV dp+X,A
+      case 0xC5: this.wr(this._abs(),  this.A); cy=5; break; // MOV abs,A
+      case 0xD5: this.wr(this._absx(), this.A); cy=6; break; // MOV abs+X,A
+      case 0xD6: this.wr(this._absy(), this.A); cy=6; break; // MOV abs+Y,A
+      case 0xC6: this.wr(this.X+(this.P?0x100:0), this.A); cy=4; break; // MOV (X),A
+      case 0xAF: this.wr(this.X+(this.P?0x100:0), this.A); this.X=(this.X+1)&0xFF; cy=4; break; // MOV (X)+,A
+      case 0xC7: this.wr(this._idx(),  this.A); cy=7; break; // MOV [dp+X],A
+      case 0xD7: this.wr(this._idy(),  this.A); cy=7; break; // MOV [dp]+Y,A
+      case 0xD8: this.wr(this._dp(),   this.X); cy=4; break; // MOV dp,X
+      case 0xD9: this.wr(this._dpy(),  this.X); cy=5; break; // MOV dp+Y,X
+      case 0xC9: this.wr(this._abs(),  this.X); cy=5; break; // MOV abs,X
+      case 0xCB: this.wr(this._dp(),   this.Y); cy=4; break; // MOV dp,Y
+      case 0xDB: this.wr(this._dpy(),  this.Y); cy=5; break; // MOV dp+Y,Y
+      case 0xCC: this.wr(this._abs(),  this.Y); cy=5; break; // MOV abs,Y
+
+      // ── MOV dp ← dp (dp,dp) ──────────────────────────────────────────────
+      case 0x8F: { const imm=this.rd(this.PC++),dst=this._dp(); this.wr(dst,imm); cy=5; break; } // MOV dp,#imm
+      case 0xFA: { const src=this._dp(),dst=this._dp(); this.wr(dst,this.rd(src)); cy=5; break; } // MOV dp,dp
+
+      // ── MOV word (MOVW) ───────────────────────────────────────────────────
+      case 0xBA: { const a=this._dp(); this.A=this.rd(a); this.Y=this.rd((a+1)&0xFFFF);
+                   this._sNZ16((this.Y<<8)|this.A); cy=5; break; } // MOVW YA,dp
+      case 0xDA: { const a=this._dp(); this.wr(a,this.A); this.wr((a+1)&0xFFFF,this.Y); cy=5; break; } // MOVW dp,YA
+
+      // ── ADC ───────────────────────────────────────────────────────────────
+      case 0x88: this.A=this._adc(this.A,this.rd(this.PC++)); cy=2; break; // ADC A,#
+      case 0x84: this.A=this._adc(this.A,this.rd(this._dp()));   cy=3; break;
+      case 0x94: this.A=this._adc(this.A,this.rd(this._dpx()));  cy=4; break;
+      case 0x85: this.A=this._adc(this.A,this.rd(this._abs()));  cy=4; break;
+      case 0x95: this.A=this._adc(this.A,this.rd(this._absx())); cy=5; break;
+      case 0x96: this.A=this._adc(this.A,this.rd(this._absy())); cy=5; break;
+      case 0x86: this.A=this._adc(this.A,this.rd(this.X+(this.P?0x100:0))); cy=3; break;
+      case 0x87: this.A=this._adc(this.A,this.rd(this._idx()));  cy=6; break;
+      case 0x97: this.A=this._adc(this.A,this.rd(this._idy()));  cy=6; break;
+      case 0x99: { const v=this.rd(this.X+(this.P?0x100:0)); this.wr(this.X+(this.P?0x100:0),this._adc(v,this.rd(this.Y+(this.P?0x100:0)))); cy=5; break; }
+      case 0x89: { const src=this._dp(),dst=this._dp(); this.wr(dst,this._adc(this.rd(dst),this.rd(src))); cy=6; break; }
+      case 0x98: { const imm=this.rd(this.PC++),dst=this._dp(); this.wr(dst,this._adc(this.rd(dst),imm)); cy=5; break; }
+
+      // ── SBC ───────────────────────────────────────────────────────────────
+      case 0xA8: this.A=this._sbc(this.A,this.rd(this.PC++)); cy=2; break;
+      case 0xA4: this.A=this._sbc(this.A,this.rd(this._dp()));   cy=3; break;
+      case 0xB4: this.A=this._sbc(this.A,this.rd(this._dpx()));  cy=4; break;
+      case 0xA5: this.A=this._sbc(this.A,this.rd(this._abs()));  cy=4; break;
+      case 0xB5: this.A=this._sbc(this.A,this.rd(this._absx())); cy=5; break;
+      case 0xB6: this.A=this._sbc(this.A,this.rd(this._absy())); cy=5; break;
+      case 0xA6: this.A=this._sbc(this.A,this.rd(this.X+(this.P?0x100:0))); cy=3; break;
+      case 0xA7: this.A=this._sbc(this.A,this.rd(this._idx()));  cy=6; break;
+      case 0xB7: this.A=this._sbc(this.A,this.rd(this._idy()));  cy=6; break;
+      case 0xB9: { const v=this.rd(this.X+(this.P?0x100:0)); this.wr(this.X+(this.P?0x100:0),this._sbc(v,this.rd(this.Y+(this.P?0x100:0)))); cy=5; break; }
+      case 0xA9: { const src=this._dp(),dst=this._dp(); this.wr(dst,this._sbc(this.rd(dst),this.rd(src))); cy=6; break; }
+      case 0xB8: { const imm=this.rd(this.PC++),dst=this._dp(); this.wr(dst,this._sbc(this.rd(dst),imm)); cy=5; break; }
+
+      // ── CMP ───────────────────────────────────────────────────────────────
+      case 0x68: { const r=this.A-this.rd(this.PC++); this.N=!!(r&0x80); this.Z=!(r&0xFF); this.C=r>=0; cy=2; break; }
+      case 0x64: { const r=this.A-this.rd(this._dp());   this.N=!!(r&0x80);this.Z=!(r&0xFF);this.C=r>=0;cy=3;break;}
+      case 0x74: { const r=this.A-this.rd(this._dpx());  this.N=!!(r&0x80);this.Z=!(r&0xFF);this.C=r>=0;cy=4;break;}
+      case 0x65: { const r=this.A-this.rd(this._abs());  this.N=!!(r&0x80);this.Z=!(r&0xFF);this.C=r>=0;cy=4;break;}
+      case 0x75: { const r=this.A-this.rd(this._absx()); this.N=!!(r&0x80);this.Z=!(r&0xFF);this.C=r>=0;cy=5;break;}
+      case 0x76: { const r=this.A-this.rd(this._absy()); this.N=!!(r&0x80);this.Z=!(r&0xFF);this.C=r>=0;cy=5;break;}
+      case 0x66: { const r=this.A-this.rd(this.X+(this.P?0x100:0)); this.N=!!(r&0x80);this.Z=!(r&0xFF);this.C=r>=0;cy=3;break;}
+      case 0x67: { const r=this.A-this.rd(this._idx());  this.N=!!(r&0x80);this.Z=!(r&0xFF);this.C=r>=0;cy=6;break;}
+      case 0x77: { const r=this.A-this.rd(this._idy());  this.N=!!(r&0x80);this.Z=!(r&0xFF);this.C=r>=0;cy=6;break;}
+      case 0x79: { const r=this.rd(this.X+(this.P?0x100:0))-this.rd(this.Y+(this.P?0x100:0)); this.N=!!(r&0x80);this.Z=!(r&0xFF);this.C=r>=0;cy=5;break;}
+      case 0x69: { const src=this._dp(),dst=this._dp(); const r=this.rd(dst)-this.rd(src); this.N=!!(r&0x80);this.Z=!(r&0xFF);this.C=r>=0;cy=6;break;}
+      case 0x78: { const imm=this.rd(this.PC++),dst=this._dp(); const r=this.rd(dst)-imm; this.N=!!(r&0x80);this.Z=!(r&0xFF);this.C=r>=0;cy=5;break;}
+      case 0xC8: { const r=this.X-this.rd(this.PC++); this.N=!!(r&0x80);this.Z=!(r&0xFF);this.C=r>=0;cy=2;break;}
+      case 0x3E: { const r=this.X-this.rd(this._dp());  this.N=!!(r&0x80);this.Z=!(r&0xFF);this.C=r>=0;cy=3;break;}
+      case 0x1E: { const r=this.X-this.rd(this._abs()); this.N=!!(r&0x80);this.Z=!(r&0xFF);this.C=r>=0;cy=4;break;}
+      case 0xAD: { const r=this.Y-this.rd(this.PC++); this.N=!!(r&0x80);this.Z=!(r&0xFF);this.C=r>=0;cy=2;break;}
+      case 0x7E: { const r=this.Y-this.rd(this._dp());  this.N=!!(r&0x80);this.Z=!(r&0xFF);this.C=r>=0;cy=3;break;}
+      case 0x5E: { const r=this.Y-this.rd(this._abs()); this.N=!!(r&0x80);this.Z=!(r&0xFF);this.C=r>=0;cy=4;break;}
+
+      // ── AND ───────────────────────────────────────────────────────────────
+      case 0x28: this.A=this._sNZ(this.A&this.rd(this.PC++)); cy=2; break;
+      case 0x24: this.A=this._sNZ(this.A&this.rd(this._dp()));   cy=3; break;
+      case 0x34: this.A=this._sNZ(this.A&this.rd(this._dpx()));  cy=4; break;
+      case 0x25: this.A=this._sNZ(this.A&this.rd(this._abs()));  cy=4; break;
+      case 0x35: this.A=this._sNZ(this.A&this.rd(this._absx())); cy=5; break;
+      case 0x36: this.A=this._sNZ(this.A&this.rd(this._absy())); cy=5; break;
+      case 0x26: this.A=this._sNZ(this.A&this.rd(this.X+(this.P?0x100:0))); cy=3; break;
+      case 0x27: this.A=this._sNZ(this.A&this.rd(this._idx()));  cy=6; break;
+      case 0x37: this.A=this._sNZ(this.A&this.rd(this._idy()));  cy=6; break;
+      case 0x39: { const v=this.rd(this.X+(this.P?0x100:0))&this.rd(this.Y+(this.P?0x100:0)); this.wr(this.X+(this.P?0x100:0),this._sNZ(v)); cy=5; break;}
+      case 0x29: { const src=this._dp(),dst=this._dp(); this.wr(dst,this._sNZ(this.rd(dst)&this.rd(src))); cy=6; break;}
+      case 0x38: { const imm=this.rd(this.PC++),dst=this._dp(); this.wr(dst,this._sNZ(this.rd(dst)&imm)); cy=5; break;}
+
+      // ── OR ────────────────────────────────────────────────────────────────
+      case 0x08: this.A=this._sNZ(this.A|this.rd(this.PC++)); cy=2; break;
+      case 0x04: this.A=this._sNZ(this.A|this.rd(this._dp()));   cy=3; break;
+      case 0x14: this.A=this._sNZ(this.A|this.rd(this._dpx()));  cy=4; break;
+      case 0x05: this.A=this._sNZ(this.A|this.rd(this._abs()));  cy=4; break;
+      case 0x15: this.A=this._sNZ(this.A|this.rd(this._absx())); cy=5; break;
+      case 0x16: this.A=this._sNZ(this.A|this.rd(this._absy())); cy=5; break;
+      case 0x06: this.A=this._sNZ(this.A|this.rd(this.X+(this.P?0x100:0))); cy=3; break;
+      case 0x07: this.A=this._sNZ(this.A|this.rd(this._idx()));  cy=6; break;
+      case 0x17: this.A=this._sNZ(this.A|this.rd(this._idy()));  cy=6; break;
+      case 0x19: { const v=this.rd(this.X+(this.P?0x100:0))|this.rd(this.Y+(this.P?0x100:0)); this.wr(this.X+(this.P?0x100:0),this._sNZ(v)); cy=5; break;}
+      case 0x09: { const src=this._dp(),dst=this._dp(); this.wr(dst,this._sNZ(this.rd(dst)|this.rd(src))); cy=6; break;}
+      case 0x18: { const imm=this.rd(this.PC++),dst=this._dp(); this.wr(dst,this._sNZ(this.rd(dst)|imm)); cy=5; break;}
+
+      // ── EOR ───────────────────────────────────────────────────────────────
+      case 0x48: this.A=this._sNZ(this.A^this.rd(this.PC++)); cy=2; break;
+      case 0x44: this.A=this._sNZ(this.A^this.rd(this._dp()));   cy=3; break;
+      case 0x54: this.A=this._sNZ(this.A^this.rd(this._dpx()));  cy=4; break;
+      case 0x45: this.A=this._sNZ(this.A^this.rd(this._abs()));  cy=4; break;
+      case 0x55: this.A=this._sNZ(this.A^this.rd(this._absx())); cy=5; break;
+      case 0x56: this.A=this._sNZ(this.A^this.rd(this._absy())); cy=5; break;
+      case 0x46: this.A=this._sNZ(this.A^this.rd(this.X+(this.P?0x100:0))); cy=3; break;
+      case 0x47: this.A=this._sNZ(this.A^this.rd(this._idx()));  cy=6; break;
+      case 0x57: this.A=this._sNZ(this.A^this.rd(this._idy()));  cy=6; break;
+      case 0x59: { const v=this.rd(this.X+(this.P?0x100:0))^this.rd(this.Y+(this.P?0x100:0)); this.wr(this.X+(this.P?0x100:0),this._sNZ(v)); cy=5; break;}
+      case 0x49: { const src=this._dp(),dst=this._dp(); this.wr(dst,this._sNZ(this.rd(dst)^this.rd(src))); cy=6; break;}
+      case 0x58: { const imm=this.rd(this.PC++),dst=this._dp(); this.wr(dst,this._sNZ(this.rd(dst)^imm)); cy=5; break;}
+
+      // ── INC / DEC ─────────────────────────────────────────────────────────
+      case 0xBC: this.A=this._sNZ((this.A+1)&0xFF); cy=2; break; // INC A
+      case 0x3D: this.X=this._sNZ((this.X+1)&0xFF); cy=2; break; // INC X
+      case 0xFC: this.Y=this._sNZ((this.Y+1)&0xFF); cy=2; break; // INC Y
+      case 0xAB: { const a=this._dp(); this.wr(a,this._sNZ((this.rd(a)+1)&0xFF)); cy=4; break; } // INC dp
+      case 0xBB: { const a=this._dpx(); this.wr(a,this._sNZ((this.rd(a)+1)&0xFF)); cy=5; break; }// INC dp+X
+      case 0xAC: { const a=this._abs(); this.wr(a,this._sNZ((this.rd(a)+1)&0xFF)); cy=5; break; }// INC abs
+      case 0x9C: this.A=this._sNZ((this.A-1)&0xFF); cy=2; break; // DEC A
+      case 0x1D: this.X=this._sNZ((this.X-1)&0xFF); cy=2; break; // DEC X
+      case 0xDC: this.Y=this._sNZ((this.Y-1)&0xFF); cy=2; break; // DEC Y
+      case 0x8B: { const a=this._dp(); this.wr(a,this._sNZ((this.rd(a)-1)&0xFF)); cy=4; break; } // DEC dp
+      case 0x9B: { const a=this._dpx(); this.wr(a,this._sNZ((this.rd(a)-1)&0xFF)); cy=5; break; }// DEC dp+X
+      case 0x8C: { const a=this._abs(); this.wr(a,this._sNZ((this.rd(a)-1)&0xFF)); cy=5; break; }// DEC abs
+
+      // ── ASL/LSR/ROL/ROR ──────────────────────────────────────────────────
+      case 0x1C: this.A=this._asl(this.A); cy=2; break;
+      case 0x0B: { const a=this._dp();  this.wr(a,this._asl(this.rd(a))); cy=4; break; }
+      case 0x1B: { const a=this._dpx(); this.wr(a,this._asl(this.rd(a))); cy=5; break; }
+      case 0x0C: { const a=this._abs(); this.wr(a,this._asl(this.rd(a))); cy=5; break; }
+      case 0x5C: this.A=this._lsr(this.A); cy=2; break;
+      case 0x4B: { const a=this._dp();  this.wr(a,this._lsr(this.rd(a))); cy=4; break; }
+      case 0x5B: { const a=this._dpx(); this.wr(a,this._lsr(this.rd(a))); cy=5; break; }
+      case 0x4C: { const a=this._abs(); this.wr(a,this._lsr(this.rd(a))); cy=5; break; }
+      case 0x3C: this.A=this._rol(this.A); cy=2; break;
+      case 0x2B: { const a=this._dp();  this.wr(a,this._rol(this.rd(a))); cy=4; break; }
+      case 0x3B: { const a=this._dpx(); this.wr(a,this._rol(this.rd(a))); cy=5; break; }
+      case 0x2C: { const a=this._abs(); this.wr(a,this._rol(this.rd(a))); cy=5; break; }
+      case 0x7C: this.A=this._ror(this.A); cy=2; break;
+      case 0x6B: { const a=this._dp();  this.wr(a,this._ror(this.rd(a))); cy=4; break; }
+      case 0x7B: { const a=this._dpx(); this.wr(a,this._ror(this.rd(a))); cy=5; break; }
+      case 0x6C: { const a=this._abs(); this.wr(a,this._ror(this.rd(a))); cy=5; break; }
+
+      // ── XCN (swap nibbles) ────────────────────────────────────────────────
+      case 0x9F: this.A=this._sNZ(((this.A>>4)|(this.A<<4))&0xFF); cy=5; break;
+
+      // ── MUL / DIV ─────────────────────────────────────────────────────────
+      case 0xCF: { const r=(this.Y*this.A)&0xFFFF; this.A=r&0xFF; this.Y=(r>>8)&0xFF;
+                   this.N=!!(this.Y&0x80); this.Z=this.Y===0; cy=9; break; }
+      case 0x9E: { if(this.X===0){this.A=0xFF;this.Y=this.A;this.N=1;this.Z=0;}
+                   else{const ya=(this.Y<<8)|this.A; this.A=(ya/this.X)|0; this.Y=ya%this.X;
+                        this.N=!!(this.A&0x80); this.Z=this.A===0; this.C=(ya%this.X)>0;}
+                   cy=12; break; }
+
+      // ── DAA / DAS ─────────────────────────────────────────────────────────
+      case 0xDF: { if(this.C||(this.A>0x99)){this.A=(this.A+0x60)&0xFF;this.C=1;}
+                   if(this.H||((this.A&0x0F)>9)){this.A=(this.A+6)&0xFF;}
+                   this._sNZ(this.A); cy=3; break; }
+      case 0xBE: { if(!this.C||(this.A>0x99)){this.A=(this.A-0x60)&0xFF;this.C=0;}
+                   if(!this.H||((this.A&0x0F)>9)){this.A=(this.A-6)&0xFF;}
+                   this._sNZ(this.A); cy=3; break; }
+
+      // ── Branch ────────────────────────────────────────────────────────────
+      case 0x2F: { const off=this.rd(this.PC++)<<24>>24; this.PC=(this.PC+off)&0xFFFF; cy=4; break; } // BRA
+      case 0xD0: { const off=this.rd(this.PC++)<<24>>24; if(!this.Z){this.PC=(this.PC+off)&0xFFFF;cy=4;}else cy=2; break; } // BNE
+      case 0xF0: { const off=this.rd(this.PC++)<<24>>24; if( this.Z){this.PC=(this.PC+off)&0xFFFF;cy=4;}else cy=2; break; } // BEQ
+      case 0xB0: { const off=this.rd(this.PC++)<<24>>24; if( this.C){this.PC=(this.PC+off)&0xFFFF;cy=4;}else cy=2; break; } // BCS
+      case 0x90: { const off=this.rd(this.PC++)<<24>>24; if(!this.C){this.PC=(this.PC+off)&0xFFFF;cy=4;}else cy=2; break; } // BCC
+      case 0x70: { const off=this.rd(this.PC++)<<24>>24; if( this.V){this.PC=(this.PC+off)&0xFFFF;cy=4;}else cy=2; break; } // BVS
+      case 0x50: { const off=this.rd(this.PC++)<<24>>24; if(!this.V){this.PC=(this.PC+off)&0xFFFF;cy=4;}else cy=2; break; } // BVC
+      case 0x30: { const off=this.rd(this.PC++)<<24>>24; if( this.N){this.PC=(this.PC+off)&0xFFFF;cy=4;}else cy=2; break; } // BMI
+      case 0x10: { const off=this.rd(this.PC++)<<24>>24; if(!this.N){this.PC=(this.PC+off)&0xFFFF;cy=4;}else cy=2; break; } // BPL
+
+      // ── BBC/BBS (branch on bit) ───────────────────────────────────────────
+      case 0x13:case 0x33:case 0x53:case 0x73:case 0x93:case 0xB3:case 0xD3:case 0xF3: {
+        const bit=(op>>5)&7,a=this._dp(),off=this.rd(this.PC++)<<24>>24;
+        if( (this.rd(a)>>bit)&1){this.PC=(this.PC+off)&0xFFFF;cy=6;}else cy=4; break; } // BBS
+      case 0x03:case 0x23:case 0x43:case 0x63:case 0x83:case 0xA3:case 0xC3:case 0xE3: {
+        const bit=(op>>5)&7,a=this._dp(),off=this.rd(this.PC++)<<24>>24;
+        if(!((this.rd(a)>>bit)&1)){this.PC=(this.PC+off)&0xFFFF;cy=6;}else cy=4; break; } // BBC
+
+      // ── CBNE ─────────────────────────────────────────────────────────────
+      case 0x2E: { const a=this._dp(),off=this.rd(this.PC++)<<24>>24;
+                   if(this.A!==this.rd(a)){this.PC=(this.PC+off)&0xFFFF;cy=6;}else cy=4; break; }
+      case 0xDE: { const a=this._dpx(),off=this.rd(this.PC++)<<24>>24;
+                   if(this.A!==this.rd(a)){this.PC=(this.PC+off)&0xFFFF;cy=7;}else cy=5; break; }
+
+      // ── DBNZ ─────────────────────────────────────────────────────────────
+      case 0x6E: { const a=this._dp(),v=(this.rd(a)-1)&0xFF; this.wr(a,v);
+                   const off=this.rd(this.PC++)<<24>>24;
+                   if(v!==0){this.PC=(this.PC+off)&0xFFFF;cy=6;}else cy=4; break; }
+      case 0xFE: { this.Y=(this.Y-1)&0xFF; const off=this.rd(this.PC++)<<24>>24;
+                   if(this.Y!==0){this.PC=(this.PC+off)&0xFFFF;cy=4;}else cy=2; break; }
+
+      // ── JMP / CALL / RET ──────────────────────────────────────────────────
+      case 0x5F: { this.PC=this._abs(); cy=3; break; } // JMP abs
+      case 0x1F: { const a=this._abs(); this.PC=(this.rd((a+this.X+1)&0xFFFF)<<8)|this.rd((a+this.X)&0xFFFF); cy=6; break; } // JMP [abs+X]
+      case 0x3F: { const lo=this.rd(this.PC++),hi=this.rd(this.PC++);
+                   this._push((this.PC>>8)&0xFF); this._push(this.PC&0xFF);
+                   this.PC=(hi<<8)|lo; cy=8; break; } // CALL abs
+      case 0x4F: { const pg=this.rd(this.PC++);
+                   this._push((this.PC>>8)&0xFF); this._push(this.PC&0xFF);
+                   this.PC=0xFF00|pg; cy=6; break; } // PCALL
+      case 0x6F: { const lo=this._pop(),hi=this._pop(); this.PC=(hi<<8)|lo; cy=5; break; } // RET
+      case 0x7F: { const lo=this._pop(),hi=this._pop(); this.PC=(hi<<8)|lo; this._setP(this._pop()); cy=6; break; } // RETI
+
+      // ── TCALL (table call $FFxx) ──────────────────────────────────────────
+      case 0x01:case 0x11:case 0x21:case 0x31:case 0x41:case 0x51:case 0x61:case 0x71:
+      case 0x81:case 0x91:case 0xA1:case 0xB1:case 0xC1:case 0xD1:case 0xE1:case 0xF1: {
+        const n=(op>>4),vec=0xFFDE-(n*2);
+        this._push((this.PC>>8)&0xFF); this._push(this.PC&0xFF);
+        this.PC=(this.rd((vec+1)&0xFFFF)<<8)|this.rd(vec&0xFFFF); cy=8; break; }
+
+      // ── PUSH / POP ────────────────────────────────────────────────────────
+      case 0x2D: this._push(this.A); cy=4; break;
+      case 0x4D: this._push(this.X); cy=4; break;
+      case 0x6D: this._push(this.Y); cy=4; break;
+      case 0x0D: this._push(this._getP()); cy=4; break;
+      case 0xAE: this.A=this._pop(); cy=4; break;
+      case 0xCE: this.X=this._pop(); cy=4; break;
+      case 0xEE: this.Y=this._pop(); cy=4; break;
+      case 0x8E: this._setP(this._pop()); cy=4; break;
+
+      // ── BIT operations ────────────────────────────────────────────────────
+      case 0x02:case 0x22:case 0x42:case 0x62:case 0x82:case 0xA2:case 0xC2:case 0xE2: {
+        const bit=(op>>5)&7,a=this._dp(); this.wr(a,this.rd(a)|(1<<bit)); cy=4; break; } // SET1
+      case 0x12:case 0x32:case 0x52:case 0x72:case 0x92:case 0xB2:case 0xD2:case 0xF2: {
+        const bit=(op>>5)&7,a=this._dp(); this.wr(a,this.rd(a)&~(1<<bit)); cy=4; break; } // CLR1
+      case 0xAA: { const ab=this._abs(); this.C=(this.rd(ab>>3)>>(ab&7))&1; cy=4; break; } // MOV1 C,bit
+      case 0xCA: { const ab=this._abs(); const b=ab&7,a=ab>>3;
+                   this.wr(a,this.C?(this.rd(a)|(1<<b)):(this.rd(a)&~(1<<b))); cy=6; break; } // MOV1 bit,C
+      case 0x6A: { const ab=this._abs(); this.C=this.C&((this.rd(ab>>3)>>(ab&7))&1); cy=4; break; } // AND1
+      case 0x4A: { const ab=this._abs(); this.C=this.C&(1^((this.rd(ab>>3)>>(ab&7))&1)); cy=4; break; } // AND1 /C
+      case 0x0A: { const ab=this._abs(); this.C=this.C|((this.rd(ab>>3)>>(ab&7))&1); cy=4; break; } // OR1
+      case 0x2A: { const ab=this._abs(); this.C=this.C|(1^((this.rd(ab>>3)>>(ab&7))&1)); cy=4; break; } // OR1 /C
+      case 0x8A: { const ab=this._abs(); this.C=this.C^((this.rd(ab>>3)>>(ab&7))&1); cy=4; break; } // EOR1
+      case 0xEA: { const ab=this._abs(); const b=ab&7,a=ab>>3;
+                   this.wr(a,this.rd(a)^(1<<b)); cy=5; break; } // NOT1
+
+      // ── Flag ops ──────────────────────────────────────────────────────────
+      case 0x60: this.C=0; cy=2; break;  // CLRC
+      case 0x80: this.C=1; cy=2; break;  // SETC
+      case 0xED: this.C^=1; cy=2; break; // NOTC
+      case 0xE0: this.V=0;this.H=0; cy=2; break; // CLRV
+      case 0x20: this.P=0; cy=2; break;  // CLRP
+      case 0x40: this.P=1; cy=2; break;  // SETP
+      case 0xA0: this.I=1; cy=2; break;  // EI
+      case 0xC0: this.I=0; cy=2; break;  // DI
+
+      // ── Misc ──────────────────────────────────────────────────────────────
+      case 0x00: cy=2; break; // NOP
+      case 0xFF: cy=2; break; // STOP (treat as NOP for our purposes)
+      case 0xEF: cy=2; break; // SLEEP (treat as NOP)
+
+      default:
+        cy=2; break; // Unknown opcode — skip gracefully
+    }
+    this.cycles += cy;
+    return cy;
+  }
+}
+
+// ── SNES SYSTEM ───────────────────────────────────────────────────────────────
+class SNES {
+  constructor(cart) {
+    this.cart=cart;
+    this.bus=new Bus(cart);
+    this.cpu=new CPU65816(this.bus);
+    this.spc=new SPC700();
+    this.ppu=new PPU();
+    this.bus.ppu=this.ppu;
+    this.bus.cpu=this.cpu;
+    this.bus.spc=this.spc;        // wire SPC ports into Bus read/write
+    this.ppu.bus=this.bus;
+    this.cpu.reset();
+    // SPC cycle accumulator — SPC700 runs at ~1.024 MHz vs main ~3.58 MHz
+    // For every 8 master clocks (1 slow CPU cycle), SPC gets ~0.381 cycles.
+    // We accumulate fractionally and step when >= 1.
+    this._spcAcc = 0;
+  }
+
+  // ── Memory helpers for Ding achievement engine ───────────────────────────────
+  // Read one byte from WRAM. addr is the bare 16-bit WRAM offset (0x0000–0x1FFFF).
+  memRead(addr)  { return this.bus.wram[addr & 0x1FFFF]; }
+  // Read a little-endian 16-bit word from WRAM.
+  memReadU16(addr){ return this.memRead(addr) | (this.memRead(addr+1) << 8); }
+  // Build a state snapshot from a memMap: [{key, addr, u16?}]
+  // Returns a plain object Ding's evalAchievement() can consume directly.
+  memSnapshot(memMap) {
+    const s = {};
+    for (const { key, addr, u16 } of memMap)
+      s[key] = u16 ? this.memReadU16(addr) : this.memRead(addr);
+    return s;
+  }
+
+  // ── Full diagnostic snapshot (called ~1×/sec from React loop) ────────────────
+  diagSnap() {
+    const cpu = this.cpu, bus = this.bus, ppu = this.ppu;
+    const h2 = v => `$${(v&0xFF).toString(16).toUpperCase().padStart(2,'0')}`;
+    const h4 = v => `$${(v&0xFFFF).toString(16).toUpperCase().padStart(4,'0')}`;
+    const vecReset = bus.read(0xFFFC) | (bus.read(0xFFFD)<<8);
+    const vecNMI   = bus.read(0xFFEA) | (bus.read(0xFFEB)<<8);
+    const vecIRQ   = bus.read(0xFFEE) | (bus.read(0xFFEF)<<8);
+    const vecBRK   = bus.read(0xFFE6) | (bus.read(0xFFE7)<<8);
+    return {
+      pc:cpu.PC, pbr:cpu.PBR, a:cpu.A, x:cpu.X, y:cpu.Y,
+      sp:cpu.SP, dp:cpu.DP, dbr:cpu.DBR, p:cpu.P, e:cpu.E,
+      pendingNMI:cpu.pendingNMI, pendingIRQ:cpu.pendingIRQ,
+      stopped:cpu.stopped, waiting:cpu.waiting, cycles:cpu.cycles,
+      inidisp:ppu.regs[0x00], obsel:ppu.regs[0x01],
+      bgmode:ppu.regs[0x05],  mosaic:ppu.regs[0x06],
+      tm:ppu.regs[0x2C],      ts:ppu.regs[0x2D],
+      cgwsel:ppu.regs[0x30],  cgadsub:ppu.regs[0x31],
+      coldata:ppu.fixedColor,
+      vramAddr:ppu.vramAddr, cgramAddr:ppu.cgramAddr, oamAddr:ppu.oamByteAddr,
+      scanline:ppu.scanline, frame:ppu.frame, vblank:ppu.vblank,
+      nmitimen:bus.nmitimen, nmiFlag:bus.nmiFlag, irqFlag:bus.irqFlag,
+      htime:bus.htime, vtime:bus.vtime, memsel:bus.memsel,
+      mdmaen:bus.mdmaen, hdmaen:bus.hdmaen,
+      apuOut:[...this.bus.apuOut], apuIn:[...this.bus.apuIn],
+      apuLog:[...this.bus.apuLog],
+      spc: this.spc ? {
+        pc:this.spc.PC, a:this.spc.A, x:this.spc.X, y:this.spc.Y,
+        sp:this.spc.SP, cycles:this.spc.cycles,
+        out:[...this.spc.outPorts], inp:[...this.spc.inPorts],
+      } : null,
+      vecReset:h4(vecReset), vecNMI:h4(vecNMI), vecIRQ:h4(vecIRQ), vecBRK:h4(vecBRK),
+      dma:bus.dmaChannels.map(c=>({
+        ctrl:h2(c.ctrl), dest:h2(c.destReg),
+        src:`${h2(c.srcBank)}:${h4(c.srcAddr)}`,
+        size:c.size, done:c.hdmaFinished,
+      })),
+      pcHistory:[...cpu.pcHistory],
+      bytesAtPC:Array.from({length:8},(_,i)=>bus.read(((cpu.PBR<<16)|((cpu.PC+i)&0xFFFF)))).map(b=>b.toString(16).toUpperCase().padStart(2,'0')),
+    };
+  }
+
+  runFrame() {
+    // ── Per-frame init ───────────────────────────────────────────────────────
+    // Initialise HDMA channel table pointers at the top of every frame.
+    if (this.bus.hdmaen) this.bus.hdmaInit();
+
+    let lastScanline = this.ppu.scanline;
+    let ppuDone      = false;
+    let guard        = 0;
+
+    while (!ppuDone && guard++ < 750000) {
+      const cyc = this.cpu.step();
+
+      // Master clocks per CPU step.
+      // FastROM ($420D bit 0 = 1) → 6 master clocks per CPU cycle.
+      // SlowROM (default)          → 8 master clocks per CPU cycle.
+      const mc = cyc * (this.bus.memsel & 1 ? 6 : 8);
+
+      // Tick SPC700 proportionally.
+      // SPC700 clock = 1,024,000 Hz, master clock = 21,477,272 Hz
+      // → SPC cycles per master clock ≈ 1/20.97 ≈ 0.04768
+      // → spcAcc += mc * 0.04768; step SPC once per accumulated integer cycle.
+      this._spcAcc += mc * 0.04768;
+      while (this._spcAcc >= 1) {
+        this.spc.step();
+        // Keep outPorts alias in sync for diagSnap
+        this.bus.apuOut[0] = this.spc.outPorts[0];
+        this.bus.apuOut[1] = this.spc.outPorts[1];
+        this.bus.apuOut[2] = this.spc.outPorts[2];
+        this.bus.apuOut[3] = this.spc.outPorts[3];
+        this._spcAcc -= 1;
+      }
+
+      ppuDone = this.ppu.advance(mc);
+
+      // ── Scanline-boundary events ─────────────────────────────────────────
+      const sl = this.ppu.scanline;
+      if (sl !== lastScanline) {
+        // HDMA fires at HBlank of each active display scanline
+        if (lastScanline < H && this.bus.hdmaen) this.bus.hdmaRun();
+        // H/V timer IRQ check (approximate: fires at scanline boundary)
+        this.bus.checkIRQ(lastScanline);
+        lastScanline = sl;
+      }
+    }
+  }
+}
+
+// ── CSS ───────────────────────────────────────────────────────────────────────
+const css = `
+  @import url('https://fonts.googleapis.com/css2?family=Bebas+Neue&family=DM+Sans:wght@300;400;500;700&family=JetBrains+Mono:wght@400;600&display=swap');
+  :root{
+    --bg:#0a0a0c;--s1:#111118;--s2:#17171f;--s3:#1e1e28;
+    --border:#262636;--border2:#323248;
+    --purple:#a855f7;--purple-dim:#6b21a8;--purple-glow:rgba(168,85,247,0.15);
+    --amber:#f5a623;--text:#e8e8f0;--dim:#9090a8;--muted:#525268;
+    --green:#4ade80;--red:#e63946;--teal:#22d3ee;
+  }
+  *{box-sizing:border-box;margin:0;padding:0;}
+  body{background:var(--bg);color:var(--text);font-family:'DM Sans',sans-serif;}
+  .snes-root{min-height:100vh;background:var(--bg);display:flex;flex-direction:column;}
+  .snes-header{display:flex;align-items:center;gap:1rem;padding:0 2rem;height:56px;background:rgba(10,10,12,0.95);border-bottom:1px solid var(--border);backdrop-filter:blur(20px);position:sticky;top:0;z-index:100;}
+  .snes-logo{font-family:'Bebas Neue';font-size:1.6rem;letter-spacing:3px;color:var(--purple);}
+  .snes-logo span{color:var(--text);}
+  .snes-badge{background:var(--purple-glow);border:1px solid rgba(168,85,247,0.3);color:var(--purple);font-size:0.65rem;font-family:'JetBrains Mono';letter-spacing:0.1em;padding:2px 8px;border-radius:3px;}
+  .snes-game-id{font-size:0.7rem;font-family:'JetBrains Mono';color:var(--teal);opacity:0.8;}
+  .snes-spacer{flex:1;}
+  .snes-rom-chip{display:flex;align-items:center;gap:0.5rem;background:var(--s2);border:1px solid var(--border);border-radius:6px;padding:0.3rem 0.75rem;font-size:0.75rem;font-family:'JetBrains Mono';color:var(--dim);}
+  .snes-rom-chip .dot{width:6px;height:6px;border-radius:50%;background:var(--purple-dim);}
+  .snes-rom-chip .dot.on{background:var(--green);box-shadow:0 0 6px var(--green);}
+  .snes-body{display:flex;gap:1.5rem;padding:1.5rem 2rem;max-width:1140px;margin:0 auto;width:100%;}
+  .snes-main{display:flex;flex-direction:column;gap:0.75rem;flex:1;}
+  .snes-screen-wrap{position:relative;background:#000;border:2px solid var(--border2);border-radius:4px;overflow:hidden;flex-shrink:0;align-self:flex-start;box-shadow:0 0 0 1px rgba(168,85,247,0.08),0 20px 60px rgba(0,0,0,0.8);}
+  .snes-canvas{display:block;image-rendering:pixelated;width:${W*SCALE}px;height:${H*SCALE}px;}
+  .snes-canvas-off{width:${W*SCALE}px;height:${H*SCALE}px;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:0.75rem;background:radial-gradient(ellipse at center,#1a1428 0%,#0a0a0c 100%);cursor:pointer;}
+  .snes-canvas-off:hover{background:radial-gradient(ellipse at center,#1e1632 0%,#0a0a0c 100%);}
+  .snes-canvas-off.drag{outline:2px dashed var(--purple);}
+  .snes-drop-icon{font-size:2.5rem;opacity:0.55;}
+  .snes-drop-title{font-family:'Bebas Neue';font-size:1.4rem;letter-spacing:2px;color:var(--dim);}
+  .snes-drop-sub{font-size:0.72rem;color:var(--muted);font-family:'JetBrains Mono';}
+  .snes-drop-error{color:var(--red);font-size:0.7rem;font-family:'JetBrains Mono';margin-top:0.25rem;}
+  .scanlines{position:absolute;inset:0;pointer-events:none;background:repeating-linear-gradient(0deg,transparent,transparent 2px,rgba(0,0,0,0.07) 2px,rgba(0,0,0,0.07) 4px);}
+  /* Scanline sweep — a 2px bar that crawls down the screen in real time */
+  .sl-bar{position:absolute;left:0;right:0;height:2px;pointer-events:none;background:rgba(168,85,247,0.35);transition:top 16ms linear;}
+  .snes-ctrl-bar{display:flex;align-items:center;gap:0.5rem;}
+  .snes-btn{padding:0.4rem 1rem;font-size:0.75rem;font-weight:600;border-radius:4px;cursor:pointer;border:1px solid var(--border2);background:var(--s2);color:var(--dim);transition:all 0.15s;letter-spacing:0.04em;font-family:'DM Sans',sans-serif;}
+  .snes-btn:hover{background:var(--s3);color:var(--text);}
+  .snes-btn.primary{background:var(--purple-glow);border-color:rgba(168,85,247,0.35);color:var(--purple);}
+  .snes-btn.primary:hover{background:rgba(168,85,247,0.22);}
+  /* FPS — coloured by health */
+  .snes-fps{margin-left:auto;font-family:'JetBrains Mono';font-size:0.7rem;display:flex;align-items:center;gap:0.4rem;}
+  .fps-val{padding:2px 7px;border-radius:3px;font-weight:600;}
+  .fps-good{color:#4ade80;background:rgba(74,222,128,0.1);}
+  .fps-warn{color:#f5a623;background:rgba(245,166,35,0.1);}
+  .fps-bad {color:#e63946;background:rgba(230,57,70,0.1);}
+  .snes-rom-bar{display:flex;align-items:center;gap:0.5rem;flex-wrap:wrap;font-size:0.72rem;font-family:'JetBrains Mono';color:var(--muted);}
+  .map-chip{display:inline-flex;align-items:center;background:var(--purple-glow);border:1px solid rgba(168,85,247,0.2);color:var(--purple);font-size:0.6rem;font-family:'JetBrains Mono';padding:1px 7px;border-radius:3px;}
+  .country-chip{display:inline-flex;align-items:center;background:rgba(34,211,238,0.08);border:1px solid rgba(34,211,238,0.2);color:var(--teal);font-size:0.6rem;font-family:'JetBrains Mono';padding:1px 7px;border-radius:3px;}
+  .snes-sidebar{display:flex;flex-direction:column;gap:0.85rem;width:240px;flex-shrink:0;}
+  .snes-card{background:var(--s1);border:1px solid var(--border);border-radius:8px;overflow:hidden;}
+  .snes-card-head{display:flex;align-items:center;gap:0.5rem;padding:0.6rem 0.85rem;background:var(--s2);border-bottom:1px solid var(--border);font-size:0.62rem;font-family:'JetBrains Mono';letter-spacing:0.12em;text-transform:uppercase;color:var(--muted);}
+  .snes-card-body{padding:0.75rem 0.85rem;}
+  .key-row{display:flex;align-items:center;justify-content:space-between;padding:0.25rem 0;border-bottom:1px solid rgba(255,255,255,0.03);}
+  .key-row:last-child{border-bottom:none;}
+  .key-action{font-size:0.75rem;color:var(--dim);}
+  .key-chips{display:flex;gap:4px;}
+  .key-chip{font-family:'JetBrains Mono';font-size:0.6rem;padding:1px 6px;background:var(--s3);border:1px solid var(--border2);border-radius:3px;color:var(--text);}
+  .state-row{display:flex;justify-content:space-between;align-items:center;padding:0.22rem 0;border-bottom:1px solid rgba(255,255,255,0.03);}
+  .state-row:last-child{border-bottom:none;}
+  .state-label{font-size:0.7rem;color:var(--muted);font-family:'JetBrains Mono';}
+  .state-val{font-size:0.7rem;color:var(--dim);font-family:'JetBrains Mono';}
+  .state-val.hi{color:var(--amber);}
+  .state-val.teal{color:var(--teal);}
+  .state-val.mode{color:var(--purple);font-size:0.65rem;}
+  /* ── Diagnostics panel ── */
+  .dbg-wrap{width:100%;max-width:1140px;margin:0 auto 2rem;padding:0 2rem;}
+  .dbg-toggle{width:100%;display:flex;align-items:center;gap:0.75rem;padding:0.55rem 1rem;background:var(--s1);border:1px solid var(--border);border-radius:8px;cursor:pointer;font-family:'JetBrains Mono';font-size:0.68rem;letter-spacing:0.1em;color:var(--muted);transition:all 0.15s;text-transform:uppercase;}
+  .dbg-toggle:hover{border-color:rgba(168,85,247,0.25);color:var(--text);}
+  .dbg-toggle.open{border-radius:8px 8px 0 0;border-bottom-color:transparent;color:var(--purple);}
+  .dbg-chevron{margin-left:auto;font-size:0.65rem;transition:transform 0.2s;}
+  .dbg-toggle.open .dbg-chevron{transform:rotate(180deg);}
+  .dbg-dot{width:7px;height:7px;border-radius:50%;background:var(--muted);flex-shrink:0;}
+  .dbg-dot.live{background:var(--green);box-shadow:0 0 6px var(--green);}
+  .dbg-panel{background:var(--s1);border:1px solid var(--border);border-top:none;border-radius:0 0 8px 8px;overflow:hidden;}
+  .dbg-tabs{display:flex;border-bottom:1px solid var(--border);background:var(--s2);}
+  .dbg-tab{padding:0.45rem 1rem;font-family:'JetBrains Mono';font-size:0.65rem;letter-spacing:0.08em;color:var(--muted);cursor:pointer;border-bottom:2px solid transparent;transition:all 0.15s;user-select:none;}
+  .dbg-tab:hover{color:var(--text);}
+  .dbg-tab.on{color:var(--amber);border-bottom-color:var(--amber);}
+  .dbg-body{padding:1rem 1.25rem;}
+  .dbg-reg-grid{display:grid;grid-template-columns:repeat(6,1fr);gap:0.4rem;margin-bottom:0.85rem;}
+  .dbg-reg{background:var(--s2);border:1px solid var(--border);border-radius:5px;padding:0.45rem 0.6rem;}
+  .dbg-reg-name{font-family:'JetBrains Mono';font-size:0.58rem;color:var(--muted);margin-bottom:0.15rem;letter-spacing:0.08em;}
+  .dbg-reg-val{font-family:'JetBrains Mono';font-size:0.82rem;color:var(--amber);font-weight:600;}
+  .dbg-reg-sub{font-family:'JetBrains Mono';font-size:0.55rem;color:var(--muted);margin-top:0.1rem;}
+  .dbg-flags{display:flex;gap:0.35rem;flex-wrap:wrap;margin-bottom:0.85rem;}
+  .dbg-flag{padding:0.18rem 0.55rem;border-radius:4px;font-family:'JetBrains Mono';font-size:0.68rem;font-weight:600;border:1px solid var(--border);background:var(--s2);color:var(--muted);transition:all 0.1s;}
+  .dbg-flag.set{background:rgba(168,85,247,0.1);border-color:rgba(168,85,247,0.3);color:var(--purple);}
+  .dbg-flag.warn{background:rgba(230,57,70,0.1);border-color:rgba(230,57,70,0.3);color:var(--red);}
+  .dbg-flag.ok{background:rgba(74,222,128,0.08);border-color:rgba(74,222,128,0.25);color:var(--green);}
+  .dbg-io-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:0.4rem;margin-bottom:0.75rem;}
+  .dbg-io-row{display:flex;justify-content:space-between;align-items:center;background:var(--s2);border:1px solid var(--border);border-radius:5px;padding:0.32rem 0.55rem;}
+  .dbg-io-left{}
+  .dbg-io-addr{font-family:'JetBrains Mono';font-size:0.58rem;color:var(--muted);}
+  .dbg-io-name{font-family:'JetBrains Mono';font-size:0.6rem;color:var(--dim);}
+  .dbg-io-val{font-family:'JetBrains Mono';font-size:0.72rem;color:var(--teal);font-weight:600;}
+  .dbg-bits-title{font-family:'JetBrains Mono';font-size:0.58rem;color:var(--muted);letter-spacing:0.1em;margin-bottom:0.3rem;margin-top:0.6rem;}
+  .dbg-bits{display:flex;gap:0.3rem;flex-wrap:wrap;}
+  .dbg-bit{padding:0.16rem 0.45rem;border-radius:3px;font-family:'JetBrains Mono';font-size:0.6rem;border:1px solid var(--border);background:var(--s2);color:var(--muted);}
+  .dbg-bit.set{background:rgba(34,211,238,0.08);border-color:rgba(34,211,238,0.25);color:var(--teal);}
+  .dbg-bit.warn{background:rgba(230,57,70,0.08);border-color:rgba(230,57,70,0.25);color:var(--red);}
+  .dbg-int-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:0.4rem;margin-bottom:0.75rem;}
+  .dbg-int-cell{background:var(--s2);border:1px solid var(--border);border-radius:5px;padding:0.45rem 0.5rem;text-align:center;}
+  .dbg-int-name{font-family:'JetBrains Mono';font-size:0.58rem;color:var(--muted);margin-bottom:0.25rem;}
+  .dbg-int-chips{display:flex;gap:0.25rem;justify-content:center;}
+  .dbg-int-chip{padding:0.12rem 0.35rem;border-radius:3px;font-family:'JetBrains Mono';font-size:0.58rem;font-weight:600;background:var(--s3);color:var(--muted);border:1px solid var(--border);}
+  .dbg-int-chip.en{background:rgba(74,222,128,0.08);color:var(--green);border-color:rgba(74,222,128,0.25);}
+  .dbg-int-chip.pend{background:rgba(245,166,35,0.1);color:var(--amber);border-color:rgba(245,166,35,0.25);}
+  .dbg-dma-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:0.4rem;}
+  .dbg-dma-cell{background:var(--s2);border:1px solid var(--border);border-radius:5px;padding:0.45rem 0.6rem;}
+  .dbg-dma-ch{font-family:'JetBrains Mono';font-size:0.58rem;color:var(--muted);margin-bottom:0.2rem;}
+  .dbg-dma-val{font-family:'JetBrains Mono';font-size:0.65rem;color:var(--dim);line-height:1.5;}
+  .dbg-log{background:#06060a;border:1px solid var(--border);border-radius:5px;padding:0.6rem 0.8rem;height:200px;overflow-y:auto;font-family:'JetBrains Mono';font-size:0.67rem;display:flex;flex-direction:column;gap:0.22rem;}
+  .dbg-log::-webkit-scrollbar{width:4px;}
+  .dbg-log::-webkit-scrollbar-thumb{background:var(--s3);border-radius:2px;}
+  .dbg-log-row{display:flex;gap:0.65rem;line-height:1.45;}
+  .dbg-log-ts{color:var(--muted);flex-shrink:0;}
+  .dbg-log-tag{flex-shrink:0;padding:0 0.3rem;border-radius:3px;font-size:0.58rem;}
+  .dbg-log-tag.cpu{background:rgba(245,166,35,0.1);color:var(--amber);}
+  .dbg-log-tag.ppu{background:rgba(34,211,238,0.08);color:var(--teal);}
+  .dbg-log-tag.irq{background:rgba(230,57,70,0.1);color:var(--red);}
+  .dbg-log-tag.dma{background:rgba(168,85,247,0.1);color:var(--purple);}
+  .dbg-log-msg{color:var(--dim);}
+`;
+
+// ── REACT COMPONENT ───────────────────────────────────────────────────────────
+// Props (all optional — works standalone or embedded in Ding):
+//   romUrl        string   — fetch & auto-load a ROM from URL on mount
+//   gameId        string   — Ding game identifier (displayed in header)
+//   memMap        array    — [{key,addr,u16?}] mapped to Ding memory addresses
+//   onStateUpdate function — called every frame with {cpu, ppu, mem} snapshot
+function SNESEmulator({ romUrl, gameId, memMap, onStateUpdate } = {}) {
+  const canvasRef   = useRef(null);
+  const snesRef     = useRef(null);
+  const rafRef      = useRef(null);
+  const fileRef     = useRef(null);
+  const fpsCountRef = useRef({ frames:0, last:0, times:[], frameCount:0 });
+  const buttonsRef  = useRef(0);
+  const lastFrameTs = useRef(0);
+
+  const [running, setRunning] = useState(false);
+  const [paused,  setPaused]  = useState(false);
+  const [drag,    setDrag]    = useState(false);
+  const [error,   setError]   = useState(null);
+  const [fps,     setFps]     = useState(0);
+  const [romInfo, setRomInfo] = useState(null);
+  const [cpuInfo, setCpuInfo] = useState(null);
+  const [ppuInfo, setPpuInfo] = useState(null);
+  const [frameCount, setFrameCount] = useState(0);
+  const [dbgOpen,  setDbgOpen]  = useState(false);
+  const [dbgTab,   setDbgTab]   = useState('cpu');
+  const [dbgSnap,  setDbgSnap]  = useState(null);
+  const [eventLog, setEventLog] = useState([]);
+  const eventLogRef  = useRef([]);
+  const prevDiagRef  = useRef({});
+  const lastDiagTs   = useRef(0);
+
+  useEffect(() => {
+    const dn = e => { const b=KEY_MAP[e.key]; if(b!==undefined){buttonsRef.current|=(1<<b);e.preventDefault();} };
+    const up = e => { const b=KEY_MAP[e.key]; if(b!==undefined) buttonsRef.current&=~(1<<b); };
+    window.addEventListener("keydown",dn); window.addEventListener("keyup",up);
+    return () => { window.removeEventListener("keydown",dn); window.removeEventListener("keyup",up); };
+  }, []);
+
+  const pushEvent = (tag, msg) => {
+    const ts = new Date().toLocaleTimeString('en-US',{hour12:false,hour:'2-digit',minute:'2-digit',second:'2-digit'});
+    const entry = { ts, tag, msg, id: Date.now()+Math.random() };
+    eventLogRef.current = [entry, ...eventLogRef.current].slice(0, 120);
+    setEventLog([...eventLogRef.current]);
+  };
+
+  const loop = useCallback((ts) => {
+    if (!snesRef.current) return;
+
+    // ── Smooth FPS: rolling average over last 60 timestamps ─────────────────
+    const fc = fpsCountRef.current;
+    fc.times.push(ts);
+    if (fc.times.length > 60) fc.times.shift();
+    if (fc.times.length >= 2) {
+      const span = fc.times[fc.times.length-1] - fc.times[0];
+      const smoothFps = Math.round((fc.times.length-1) / (span/1000));
+      if (Math.abs(smoothFps - fps) >= 1) setFps(smoothFps);
+    }
+
+    if (!paused) {
+      // ── 60 fps throttle: skip if we're called more than ~2ms early ────────
+      const target = lastFrameTs.current + 14; // ~16.7ms between frames
+      if (ts < target) { rafRef.current = requestAnimationFrame(loop); return; }
+      lastFrameTs.current = ts;
+
+      // ── Run one emulated frame ─────────────────────────────────────────────
+      snesRef.current.bus.joypad[0] = buttonsRef.current;
+      snesRef.current.runFrame();
+
+      // ── Blit pixel buffer to canvas ────────────────────────────────────────
+      const canvas = canvasRef.current;
+      if (canvas) {
+        const ctx = canvas.getContext('2d');
+        const img = ctx.createImageData(W, H);
+        new Uint32Array(img.data.buffer).set(snesRef.current.ppu.pixels);
+        ctx.putImageData(img, 0, 0);
+      }
+
+      // ── Collect snapshots ──────────────────────────────────────────────────
+      const cpu = snesRef.current.cpu.snapshot();
+      const ppu = snesRef.current.ppu.ppuSnapshot();
+      setCpuInfo(cpu);
+      setPpuInfo(ppu);
+      setFrameCount(ppu.frame);
+
+      // ── Diagnostic snap + event log (~1×/sec) ─────────────────────────────
+      if (ts - lastDiagTs.current >= 1000) {
+        lastDiagTs.current = ts;
+        const snap = snesRef.current.diagSnap();
+        setDbgSnap(snap);
+        const prev = prevDiagRef.current;
+        // Change detection → event log
+        if (prev.inidisp !== undefined) {
+          const wasBlank = !!(prev.inidisp & 0x80), isBlank = !!(snap.inidisp & 0x80);
+          if (wasBlank !== isBlank)
+            pushEvent('ppu', `INIDISP: screen ${isBlank ? 'forced BLANK' : 'ENABLED'} (brightness ${snap.inidisp & 0xF})`);
+          if (prev.inidisp !== snap.inidisp)
+            pushEvent('ppu', `INIDISP $${prev.inidisp.toString(16).toUpperCase().padStart(2,'0')} → $${snap.inidisp.toString(16).toUpperCase().padStart(2,'0')} (blank:${isBlank?1:0} bright:${snap.inidisp&0xF})`);
+        }
+        if (prev.bgmode !== undefined && prev.bgmode !== snap.bgmode)
+          pushEvent('ppu', `BGMODE → $${snap.bgmode.toString(16).toUpperCase()} (Mode ${snap.bgmode & 7})`);
+        if (prev.tm !== undefined && prev.tm !== snap.tm)
+          pushEvent('ppu', `TM (main layers) → $${snap.tm.toString(16).toUpperCase().padStart(2,'0')}`);
+        if (prev.nmitimen !== undefined && prev.nmitimen !== snap.nmitimen)
+          pushEvent('irq', `NMITIMEN → $${snap.nmitimen.toString(16).toUpperCase().padStart(2,'0')} (NMI:${snap.nmitimen>>7} IRQ:${(snap.nmitimen>>4)&3})`);
+        if (prev.e !== undefined && prev.e !== snap.e)
+          pushEvent('cpu', `CPU mode → ${snap.e ? 'Emulation' : 'Native (65816)'}`);
+        if (prev.stopped !== undefined && snap.stopped && !prev.stopped)
+          pushEvent('cpu', 'CPU STP — halted until reset');
+        if (prev.waiting !== undefined && snap.waiting && !prev.waiting)
+          pushEvent('cpu', 'CPU WAI — waiting for interrupt');
+        if (prev.waiting !== undefined && !snap.waiting && prev.waiting)
+          pushEvent('cpu', 'CPU WAI released');
+        if (prev.apuOut !== undefined) {
+          for (let i = 0; i < 4; i++) {
+            if (prev.apuOut[i] !== snap.apuOut[i])
+              pushEvent('cpu', `APU port $214${i} out: $${prev.apuOut[i].toString(16).toUpperCase().padStart(2,'0')} → $${snap.apuOut[i].toString(16).toUpperCase().padStart(2,'0')}`);
+            if (prev.apuIn[i] !== snap.apuIn[i])
+              pushEvent('cpu', `APU port $214${i} in:  $${prev.apuIn[i].toString(16).toUpperCase().padStart(2,'0')} → $${snap.apuIn[i].toString(16).toUpperCase().padStart(2,'0')}`);
+          }
+        }
+        if (prev.hdmaen !== undefined && prev.hdmaen !== snap.hdmaen)
+          pushEvent('dma', `HDMA enable → $${snap.hdmaen.toString(16).toUpperCase().padStart(2,'0')}`);
+        if (prev.pendingNMI !== undefined && snap.pendingNMI && !prev.pendingNMI)
+          pushEvent('irq', `NMI fired → vector ${snap.vecNMI}`);
+        if (prev.pendingIRQ !== undefined && snap.pendingIRQ && !prev.pendingIRQ)
+          pushEvent('irq', `IRQ fired → vector ${snap.vecIRQ}`);
+        prevDiagRef.current = snap;
+      }
+
+      // ── Ding integration: fire onStateUpdate every frame ──────────────────
+      if (onStateUpdate) {
+        const mem = memMap ? snesRef.current.memSnapshot(memMap) : {};
+        onStateUpdate({ cpu, ppu, mem });
+      }
+    }
+    rafRef.current = requestAnimationFrame(loop);
+  }, [paused, fps, onStateUpdate, memMap]);
+
+  useEffect(() => {
+    if (running) rafRef.current=requestAnimationFrame(loop);
+    return () => { if(rafRef.current) cancelAnimationFrame(rafRef.current); };
+  }, [running, loop]);
+
+  // Auto-load from URL prop (for Ding embedding)
+  useEffect(() => {
+    if (!romUrl) return;
+    fetch(romUrl)
+      .then(r => { if(!r.ok) throw new Error(`HTTP ${r.status}`); return r.arrayBuffer(); })
+      .then(buf => loadROM(new File([buf], romUrl.split('/').pop()||'rom.sfc')))
+      .catch(e => setError(`romUrl: ${e.message}`));
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [romUrl]);
+
+  const loadROM = useCallback((file) => {
+    if (!file) return;
+    const ext=file.name.split('.').pop().toLowerCase();
+    if (!['sfc','smc','fig'].includes(ext)) { setError(`Unsupported: .${ext} — need .sfc or .smc`); return; }
+    const reader=new FileReader();
+    reader.onload=(e) => {
+      try {
+        const data=new Uint8Array(e.target.result);
+        const cart=new Cartridge(data);
+        const snes=new SNES(cart);
+        snesRef.current=snes;
+        setRomInfo({ title:cart.title, map:cart.mapLabel,
+          romKB:Math.round(cart.rom.length/1024), ramKB:cart.sram.length>0?Math.round(cart.sram.length/1024):0,
+          version:cart.version, country:cart.country });
+        setError(null); setRunning(true); setPaused(false);
+      } catch(err) { setError(err.message); }
+    };
+    reader.readAsArrayBuffer(file);
+  }, []);
+
+  const onFile  = e  => loadROM(e.target.files[0]);
+  const onDrop  = e  => { e.preventDefault(); setDrag(false); loadROM(e.dataTransfer.files[0]); };
+  const onReset = () => snesRef.current?.cpu.reset();
+  const onEject = () => {
+    if (rafRef.current) cancelAnimationFrame(rafRef.current);
+    snesRef.current=null;
+    setRunning(false); setPaused(false); setRomInfo(null); setCpuInfo(null); setPpuInfo(null); setFrameCount(0); setDbgSnap(null); setEventLog([]); setError(null); setFps(0);
+    eventLogRef.current=[]; prevDiagRef.current={};
+  };
+
+  // Country code → human name for ROM bar
+  const COUNTRIES = ['Japan','USA','Europe','Sweden','Finland','Denmark','France','Netherlands',
+                     'Spain','Germany','Italy','China','Indonesia','South Korea','Canada','Brazil',
+                     'Australia','New Zealand','Spain','Portugal','UK','Other'];
+  const fpsClass = fps >= 58 ? 'fps-good' : fps >= 45 ? 'fps-warn' : 'fps-bad';
+  const MODE_NAMES = ['0 (4BG 2bpp)','1 (2×4bpp+2bpp)','2 (offset-per-tile)',
+                      '3 (8bpp+4bpp)','4 (8bpp+2bpp)','5 (hi-res)','6 (offset+hi)','7 (affine)'];
+  const slPct = ppuInfo ? (ppuInfo.scanline / SCANLINES) * 100 : 0;
+
+  return (
+    <div className="snes-root">
+      <style>{css}</style>
+
+      {/* ── Header ── */}
+      <header className="snes-header">
+        <div className="snes-logo">D!ng<span>SNES</span></div>
+        <div className="snes-badge">Work In Progress</div>
+        {gameId && <div className="snes-game-id">#{gameId}</div>}
+        <div className="snes-spacer"/>
+        <div className="snes-rom-chip">
+          <div className={`dot${running?' on':''}`}/>
+          {romInfo ? romInfo.title : 'No ROM loaded'}
+        </div>
+      </header>
+
+      <div className="snes-body">
+        <div className="snes-main">
+
+          {/* ── Screen ── */}
+          <div className="snes-screen-wrap">
+            {running ? (
+              <>
+                <canvas ref={canvasRef} className="snes-canvas" width={W} height={H}/>
+                <div className="scanlines"/>
+                {/* Scanline sweep bar — shows current PPU raster position */}
+                {ppuInfo && !ppuInfo.vblank && (
+                  <div className="sl-bar" style={{top:`${slPct}%`}}/>
+                )}
+              </>
+            ) : (
+              <div
+                className={`snes-canvas-off${drag?' drag':''}`}
+                onClick={() => fileRef.current?.click()}
+                onDragOver={e=>{e.preventDefault();setDrag(true);}}
+                onDragLeave={()=>setDrag(false)}
+                onDrop={onDrop}
+              >
+                <div className="snes-drop-icon">🎮</div>
+                <div className="snes-drop-title">Drop a ROM</div>
+                <div className="snes-drop-sub">.sfc · .smc · .fig · LoROM / HiROM / ExHiROM</div>
+                {error && <div className="snes-drop-error">⚠ {error}</div>}
+              </div>
+            )}
+          </div>
+
+          {/* ── Controls bar ── */}
+          {running && (
+            <div className="snes-ctrl-bar">
+              <button className="snes-btn primary" onClick={()=>setPaused(p=>!p)}>
+                {paused?'▶ Resume':'⏸ Pause'}
+              </button>
+              <button className="snes-btn" onClick={onReset}>↺ Reset</button>
+              <button className="snes-btn" onClick={onEject}>⏏ Eject</button>
+              <div className="snes-fps">
+                <span className={`fps-val ${fpsClass}`}>{fps} FPS</span>
+                <span style={{color:'var(--muted)'}}>f#{frameCount.toLocaleString()}</span>
+              </div>
+            </div>
+          )}
+
+          {/* ── ROM info bar ── */}
+          {running && romInfo && (
+            <div className="snes-rom-bar">
+              <span className="map-chip">{romInfo.map}</span>
+              {romInfo.country !== undefined &&
+                <span className="country-chip">{COUNTRIES[romInfo.country] ?? `$${romInfo.country.toString(16).toUpperCase()}`}</span>}
+              <span>{romInfo.title}</span>
+              <span>·</span>
+              <span>{romInfo.romKB}KB ROM</span>
+              {romInfo.ramKB>0&&<><span>·</span><span>{romInfo.ramKB}KB SRAM</span></>}
+              <span>·</span>
+              <span>v{romInfo.version}</span>
+            </div>
+          )}
+
+          <input ref={fileRef} type="file" accept=".sfc,.smc,.fig" style={{display:'none'}} onChange={onFile}/>
+        </div>
+
+        {/* ── Sidebar ── */}
+        <div className="snes-sidebar">
+
+          {/* Controls */}
+          <div className="snes-card">
+            <div className="snes-card-head">⌨ Controls</div>
+            <div className="snes-card-body">
+              {KEYS_DISPLAY.map(k=>(
+                <div className="key-row" key={k.action}>
+                  <span className="key-action">{k.action}</span>
+                  <span className="key-chips">{k.chips.map(c=><span key={c} className="key-chip">{c}</span>)}</span>
+                </div>
+              ))}
+            </div>
+          </div>
+
+          {/* CPU State */}
+          {cpuInfo && (
+            <div className="snes-card">
+              <div className="snes-card-head">🔬 CPU State</div>
+              <div className="snes-card-body">
+                {[
+                  ['PBR:PC',`$${cpuInfo.pbr.toString(16).padStart(2,'0').toUpperCase()}:${cpuInfo.pc.toString(16).padStart(4,'0').toUpperCase()}`],
+                  ['A', `$${cpuInfo.a.toString(16).padStart(4,'0').toUpperCase()}`],
+                  ['X', `$${cpuInfo.x.toString(16).padStart(4,'0').toUpperCase()}`],
+                  ['Y', `$${cpuInfo.y.toString(16).padStart(4,'0').toUpperCase()}`],
+                  ['SP',`$${cpuInfo.sp.toString(16).padStart(4,'0').toUpperCase()}`],
+                  ['DP',`$${cpuInfo.dp.toString(16).padStart(4,'0').toUpperCase()}`],
+                  ['DBR',`$${cpuInfo.dbr.toString(16).padStart(2,'0').toUpperCase()}`],
+                ].map(([l,v])=>(
+                  <div className="state-row" key={l}>
+                    <span className="state-label">{l}</span>
+                    <span className={`state-val${l==='PBR:PC'?' hi':''}`}>{v}</span>
+                  </div>
+                ))}
+                <div className="state-row">
+                  <span className="state-label">NV·MXDIZC</span>
+                  <span className="state-val" style={{letterSpacing:'0.12em',color:'var(--purple)'}}>
+                    {[7,6,5,4,3,2,1,0].map(b=>(
+                      <span key={b} style={{opacity:(cpuInfo.p>>b)&1?1:0.25}}>{(cpuInfo.p>>b)&1}</span>
+                    ))}
+                  </span>
+                </div>
+                <div className="state-row">
+                  <span className="state-label">Mode</span>
+                  <span className="state-val mode">{cpuInfo.e?'Emulation':'Native'}</span>
+                </div>
+                <div className="state-row">
+                  <span className="state-label">Cycles</span>
+                  <span className="state-val">{cpuInfo.cycles.toLocaleString()}</span>
+                </div>
+              </div>
+            </div>
+          )}
+
+          {/* Live PPU Stats */}
+          {ppuInfo && (
+            <div className="snes-card">
+              <div className="snes-card-head">📺 PPU State</div>
+              <div className="snes-card-body">
+                {[
+                  ['Frame',   frameCount.toLocaleString()],
+                  ['Scanline',`${ppuInfo.scanline} / ${SCANLINES}`],
+                  ['VBlank',  ppuInfo.vblank ? 'yes' : 'no'],
+                  ['BG Mode', MODE_NAMES[ppuInfo.mode] ?? ppuInfo.mode],
+                  ['TM',      `$${ppuInfo.tm.toString(16).toUpperCase().padStart(2,'0')}`],
+                  ['Bright',  `${ppuInfo.inidisp & 0x0F}/15${ppuInfo.inidisp&0x80?' (blank)':''}`],
+                ].map(([l,v])=>(
+                  <div className="state-row" key={l}>
+                    <span className="state-label">{l}</span>
+                    <span className={`state-val${l==='BG Mode'?' teal':''}`}>{v}</span>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+
+        </div>
+      </div>
+
+      {/* ── Diagnostics Panel ── */}
+      <div className="dbg-wrap">
+        <button className={`dbg-toggle${dbgOpen?' open':''}`} onClick={()=>setDbgOpen(o=>!o)}>
+          <div className={`dbg-dot${running?' live':''}`}/>
+          🔧 Diagnostics
+          {dbgSnap && (
+            <span style={{fontFamily:"'JetBrains Mono'",fontSize:'0.62rem',color:'var(--dim)',marginLeft:'0.5rem',letterSpacing:'0.04em'}}>
+              {`$${dbgSnap.pbr.toString(16).padStart(2,'0').toUpperCase()}:${dbgSnap.pc.toString(16).padStart(4,'0').toUpperCase()}`}
+              {' · '}INIDISP:{`$${dbgSnap.inidisp.toString(16).padStart(2,'0').toUpperCase()}`}
+              {' · '}SL:{dbgSnap.scanline}
+              {' · '}NMI:{(dbgSnap.nmitimen>>7)&1} IRQ:{(dbgSnap.nmitimen>>4)&3}
+            </span>
+          )}
+          <span className="dbg-chevron">▼</span>
+        </button>
+
+        {dbgOpen && (
+          <div className="dbg-panel">
+            <div className="dbg-tabs">
+              {[['cpu','CPU'],['ppu','PPU / IO'],['irq','INTERRUPTS'],['dma','DMA'],['apu','APU LOG'],['log','EVENT LOG']].map(([id,label])=>(
+                <div key={id} className={`dbg-tab${dbgTab===id?' on':''}`} onClick={()=>setDbgTab(id)}>{label}</div>
+              ))}
+            </div>
+
+            <div className="dbg-body">
+              {!dbgSnap && (
+                <div style={{color:'var(--muted)',fontFamily:"'JetBrains Mono'",fontSize:'0.72rem',padding:'1rem 0'}}>
+                  Load a ROM to see diagnostics.
+                </div>
+              )}
+
+              {/* ── CPU tab ── */}
+              {dbgSnap && dbgTab==='cpu' && (()=>{
+                const h2=v=>`$${(v&0xFF).toString(16).toUpperCase().padStart(2,'0')}`;
+                const h4=v=>`$${(v&0xFFFF).toString(16).toUpperCase().padStart(4,'0')}`;
+                const FLAGS=[['N',7],['V',6],['M',5],['X',4],['D',3],['I',2],['Z',1],['C',0]];
+                return (<>
+                  <div className="dbg-reg-grid">
+                    {[
+                      ['PBR:PC', `$${dbgSnap.pbr.toString(16).padStart(2,'0').toUpperCase()}:${dbgSnap.pc.toString(16).padStart(4,'0').toUpperCase()}`, 'program counter'],
+                      ['A',  h4(dbgSnap.a),  `${dbgSnap.a}`],
+                      ['X',  h4(dbgSnap.x),  `${dbgSnap.x}`],
+                      ['Y',  h4(dbgSnap.y),  `${dbgSnap.y}`],
+                      ['SP', h4(dbgSnap.sp), 'stack ptr'],
+                      ['DP', h4(dbgSnap.dp), 'direct pg'],
+                      ['DBR',h2(dbgSnap.dbr),'data bank'],
+                      ['P',  h2(dbgSnap.p),  'status'],
+                      ['Mode',dbgSnap.e?'Emul':'Native','E flag'],
+                      ['Cycles',dbgSnap.cycles.toLocaleString(),'total'],
+                      ['WAI', dbgSnap.waiting?'YES':'no', 'waiting'],
+                      ['STP', dbgSnap.stopped?'YES':'no', 'stopped'],
+                    ].map(([n,v,s])=>(
+                      <div className="dbg-reg" key={n}>
+                        <div className="dbg-reg-name">{n}</div>
+                        <div className="dbg-reg-val" style={n==='WAI'&&dbgSnap.waiting||n==='STP'&&dbgSnap.stopped?{color:'var(--red)'}:{}}>{v}</div>
+                        <div className="dbg-reg-sub">{s}</div>
+                      </div>
+                    ))}
+                  </div>
+                  <div className="dbg-bits-title">STATUS FLAGS  (P = {h2(dbgSnap.p)})</div>
+                  <div className="dbg-flags">
+                    {FLAGS.map(([name,bit])=>(
+                      <div key={name} className={`dbg-flag${(dbgSnap.p>>bit)&1?' set':''}`}>{name} {(dbgSnap.p>>bit)&1}</div>
+                    ))}
+                    <div className={`dbg-flag${dbgSnap.pendingNMI?' pend':''}`} style={dbgSnap.pendingNMI?{background:'rgba(245,166,35,0.1)',borderColor:'rgba(245,166,35,0.3)',color:'var(--amber)'}:{}}>NMI {dbgSnap.pendingNMI?'⚡':'-'}</div>
+                    <div className={`dbg-flag${dbgSnap.pendingIRQ?' pend':''}`} style={dbgSnap.pendingIRQ?{background:'rgba(245,166,35,0.1)',borderColor:'rgba(245,166,35,0.3)',color:'var(--amber)'}:{}}>IRQ {dbgSnap.pendingIRQ?'⚡':'-'}</div>
+                  </div>
+                  <div className="dbg-bits-title">BYTES AT PC — {`$${dbgSnap.pbr.toString(16).padStart(2,'0').toUpperCase()}:${dbgSnap.pc.toString(16).padStart(4,'0').toUpperCase()}`}</div>
+                  <div style={{background:'var(--s2)',border:'1px solid var(--border)',borderRadius:'5px',padding:'0.45rem 0.75rem',fontFamily:"'JetBrains Mono'",fontSize:'0.75rem',color:'var(--teal)',letterSpacing:'0.12em'}}>
+                    {dbgSnap.bytesAtPC ? dbgSnap.bytesAtPC.join(' ') : '—'}
+                  </div>
+                  <div className="dbg-bits-title">PC TRACE — last 24 unique addresses (newest first)</div>
+                  <div style={{background:'var(--s2)',border:'1px solid var(--border)',borderRadius:'5px',padding:'0.5rem 0.75rem',fontFamily:"'JetBrains Mono'",fontSize:'0.63rem',lineHeight:'1.8',color:'var(--dim)'}}>
+                    {dbgSnap.pcHistory && dbgSnap.pcHistory.length > 0
+                      ? [...dbgSnap.pcHistory].reverse().map((addr,i)=>{
+                          const bank=(addr>>16)&0xFF, pc=addr&0xFFFF;
+                          const label=`$${bank.toString(16).padStart(2,'0').toUpperCase()}:${pc.toString(16).padStart(4,'0').toUpperCase()}`;
+                          return <span key={i} style={{marginRight:'0.85rem',color:i===0?'var(--amber)':'var(--dim)'}}>{label}</span>;
+                        })
+                      : <span style={{color:'var(--muted)',fontStyle:'italic'}}>No trace yet</span>
+                    }
+                  </div>
+                </>);
+              })()}
+
+              {/* ── PPU / IO tab ── */}
+              {dbgSnap && dbgTab==='ppu' && (()=>{
+                const h2=v=>`$${(v&0xFF).toString(16).toUpperCase().padStart(2,'0')}`;
+                const INIDISP_BITS=[[7,'Forced blank (BIT 7)'],[3,'Bright b3'],[2,'Bright b2'],[1,'Bright b1'],[0,'Bright b0']];
+                const TM_BITS=[[4,'OBJ'],[3,'BG4'],[2,'BG3'],[1,'BG2'],[0,'BG1']];
+                const BGMODE_BITS=[[7,'BG4 16px'],[6,'BG3 16px'],[5,'BG2 16px'],[4,'BG1 16px'],[2,'M b2'],[1,'M b1'],[0,'M b0']];
+                return (<>
+                  <div className="dbg-io-grid">
+                    {[
+                      ['$2100','INIDISP', h2(dbgSnap.inidisp)],
+                      ['$2101','OBSEL',   h2(dbgSnap.obsel)],
+                      ['$2105','BGMODE',  h2(dbgSnap.bgmode)],
+                      ['$2106','MOSAIC',  h2(dbgSnap.mosaic)],
+                      ['$212C','TM',      h2(dbgSnap.tm)],
+                      ['$212D','TS',      h2(dbgSnap.ts)],
+                      ['$2130','CGWSEL',  h2(dbgSnap.cgwsel)],
+                      ['$2131','CGADSUB', h2(dbgSnap.cgadsub)],
+                      ['VRAM', 'addr',    `$${dbgSnap.vramAddr.toString(16).toUpperCase().padStart(4,'0')}`],
+                      ['CGRAM','addr',    `$${dbgSnap.cgramAddr.toString(16).toUpperCase().padStart(2,'0')}`],
+                      ['OAM',  'addr',    `$${dbgSnap.oamAddr.toString(16).toUpperCase().padStart(3,'0')}`],
+                      ['Frame','',        `${dbgSnap.frame}`],
+                    ].map(([addr,name,val])=>(
+                      <div className="dbg-io-row" key={addr}>
+                        <div className="dbg-io-left">
+                          <div className="dbg-io-addr">{addr}</div>
+                          <div className="dbg-io-name">{name}</div>
+                        </div>
+                        <div className="dbg-io-val">{val}</div>
+                      </div>
+                    ))}
+                  </div>
+                  <div className="dbg-bits-title">INIDISP BITS{(dbgSnap.inidisp&0x80)?' ⚠ FORCED BLANK':''}</div>
+                  <div className="dbg-bits">
+                    {INIDISP_BITS.map(([bit,label])=>(
+                      <div key={bit} className={`dbg-bit${(dbgSnap.inidisp>>bit)&1?(bit===7?' warn':' set'):''}`}>{label}</div>
+                    ))}
+                  </div>
+                  <div className="dbg-bits-title">TM — MAIN SCREEN LAYERS</div>
+                  <div className="dbg-bits">
+                    {TM_BITS.map(([bit,label])=>(
+                      <div key={bit} className={`dbg-bit${(dbgSnap.tm>>bit)&1?' set':''}`}>{label}</div>
+                    ))}
+                  </div>
+                  <div className="dbg-bits-title">BGMODE BITS</div>
+                  <div className="dbg-bits">
+                    {BGMODE_BITS.map(([bit,label])=>(
+                      <div key={bit} className={`dbg-bit${(dbgSnap.bgmode>>bit)&1?' set':''}`}>{label}</div>
+                    ))}
+                  </div>
+                </>);
+              })()}
+
+              {/* ── INTERRUPTS tab ── */}
+              {dbgSnap && dbgTab==='irq' && (()=>{
+                const h2=v=>`$${(v&0xFF).toString(16).toUpperCase().padStart(2,'0')}`;
+                const NMITIMEN_BITS=[[7,'NMI en'],[6,'Auto-joy'],[5,'H-IRQ'],[4,'V-IRQ']];
+                return (<>
+                  <div className="dbg-int-grid">
+                    {[
+                      {name:'NMI',   en:!!(dbgSnap.nmitimen&0x80), pend:dbgSnap.pendingNMI,  flag:!!(dbgSnap.nmiFlag&0x80), vec:dbgSnap.vecNMI},
+                      {name:'IRQ',   en:!!((dbgSnap.nmitimen>>4)&3), pend:dbgSnap.pendingIRQ, flag:!!(dbgSnap.irqFlag&0x80), vec:dbgSnap.vecIRQ},
+                      {name:'RESET', en:true, pend:false, flag:false, vec:dbgSnap.vecReset},
+                      {name:'BRK',   en:true, pend:false, flag:false, vec:dbgSnap.vecBRK},
+                    ].map(({name,en,pend,flag,vec})=>(
+                      <div className="dbg-int-cell" key={name}>
+                        <div className="dbg-int-name">{name}</div>
+                        <div className="dbg-int-chips">
+                          <div className={`dbg-int-chip${en?' en':''}`}>EN:{en?1:0}</div>
+                          <div className={`dbg-int-chip${pend?' pend':''}`}>PEND:{pend?1:0}</div>
+                          <div className={`dbg-int-chip${flag?' pend':''}`}>FLAG:{flag?1:0}</div>
+                        </div>
+                        <div style={{fontFamily:"'JetBrains Mono'",fontSize:'0.58rem',color:'var(--muted)',marginTop:'0.3rem'}}>{vec}</div>
+                      </div>
+                    ))}
+                  </div>
+                  <div className="dbg-io-grid">
+                    {[
+                      ['$4200','NMITIMEN',h2(dbgSnap.nmitimen)],
+                      ['$4210','RDNMI',   h2(dbgSnap.nmiFlag)],
+                      ['$4211','TIMEUP',  h2(dbgSnap.irqFlag)],
+                      ['$420D','MEMSEL',  h2(dbgSnap.memsel)],
+                      ['HTIME','H timer', `${dbgSnap.htime}`],
+                      ['VTIME','V timer', `${dbgSnap.vtime}`],
+                      ['IRQ mode',((dbgSnap.nmitimen>>4)&3)===0?'OFF':((dbgSnap.nmitimen>>4)&3)===1?'H':((dbgSnap.nmitimen>>4)&3)===2?'V':'H+V',''],
+                      ['CPU ROM',dbgSnap.memsel&1?'FastROM':'SlowROM','$420D'],
+                      ['APU OUT','$2140–3', dbgSnap.apuOut ? dbgSnap.apuOut.map(b=>`$${b.toString(16).toUpperCase().padStart(2,'0')}`).join(' ') : '—'],
+                      ['APU IN', '$2140–3', dbgSnap.apuIn  ? dbgSnap.apuIn.map(b=>`$${b.toString(16).toUpperCase().padStart(2,'0')}`).join(' ')  : '—'],
+                    ].map(([addr,name,val])=>(
+                      <div className="dbg-io-row" key={addr}>
+                        <div className="dbg-io-left">
+                          <div className="dbg-io-addr">{addr}</div>
+                          <div className="dbg-io-name">{name}</div>
+                        </div>
+                        <div className="dbg-io-val">{val}</div>
+                      </div>
+                    ))}
+                  </div>
+                  <div className="dbg-bits-title">NMITIMEN BITS</div>
+                  <div className="dbg-bits">
+                    {NMITIMEN_BITS.map(([bit,label])=>(
+                      <div key={bit} className={`dbg-bit${(dbgSnap.nmitimen>>bit)&1?' set':''}`}>{label}</div>
+                    ))}
+                  </div>
+                </>);
+              })()}
+
+              {/* ── DMA tab ── */}
+              {dbgSnap && dbgTab==='dma' && (<>
+                <div style={{fontFamily:"'JetBrains Mono'",fontSize:'0.65rem',color:'var(--dim)',marginBottom:'0.75rem'}}>
+                  GDMA active: <span style={{color:dbgSnap.mdmaen?'var(--amber)':'var(--muted)'}}>{dbgSnap.mdmaen?`$${dbgSnap.mdmaen.toString(16).toUpperCase().padStart(2,'0')}`:'none'}</span>
+                  <span style={{marginLeft:'1.5rem'}}>HDMA enabled: <span style={{color:dbgSnap.hdmaen?'var(--teal)':'var(--muted)'}}>{dbgSnap.hdmaen?`$${dbgSnap.hdmaen.toString(16).toUpperCase().padStart(2,'0')}`:'none'}</span></span>
+                </div>
+                <div className="dbg-dma-grid">
+                  {dbgSnap.dma.map((c,i)=>{
+                    const active=(dbgSnap.hdmaen>>(i))&1;
+                    return (
+                      <div className="dbg-dma-cell" key={i} style={active?{borderColor:'rgba(34,211,238,0.3)'}:{}}>
+                        <div className="dbg-dma-ch" style={active?{color:'var(--teal)'}:{}}>CH {i}{active?' ·HDMA':''}</div>
+                        <div className="dbg-dma-val">
+                          ctrl {c.ctrl}<br/>
+                          dest {c.dest}<br/>
+                          src {c.src}<br/>
+                          {c.size>0?`size ${c.size}`:'size —'}
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+              </>)}
+
+              {/* ── APU Log tab ── */}
+              {dbgTab==='apu' && (
+                <div>
+                  <div style={{fontFamily:"'JetBrains Mono'",fontSize:'0.62rem',color:'var(--dim)',marginBottom:'0.6rem'}}>
+                    Last {dbgSnap?.apuLog?.length??0} APU port accesses (newest last) — R=read by CPU, W=written by CPU
+                  </div>
+                  <div className="dbg-log" style={{height:'240px'}}>
+                    {(!dbgSnap?.apuLog || dbgSnap.apuLog.length===0) && (
+                      <div style={{color:'var(--muted)',fontStyle:'italic'}}>No APU accesses yet</div>
+                    )}
+                    {dbgSnap?.apuLog?.map((e,i)=>{
+                      const isRead = e.dir==='R';
+                      const portColor = ['var(--amber)','var(--teal)','var(--green)','var(--purple)'][e.port];
+                      return (
+                        <div className="dbg-log-row" key={i}>
+                          <span style={{fontFamily:"'JetBrains Mono'",fontSize:'0.62rem',
+                            color:isRead?'var(--teal)':'var(--amber)',
+                            background:isRead?'rgba(34,211,238,0.08)':'rgba(245,166,35,0.08)',
+                            padding:'0 0.3rem',borderRadius:'3px',flexShrink:0}}>
+                            {e.dir}
+                          </span>
+                          <span style={{color:'var(--muted)',fontSize:'0.62rem',flexShrink:0}}>
+                            $214{e.port}
+                          </span>
+                          <span style={{color:portColor,fontSize:'0.68rem',fontWeight:600,flexShrink:0}}>
+                            ${e.val.toString(16).toUpperCase().padStart(2,'0')}
+                          </span>
+                          <span style={{color:'var(--muted)',fontSize:'0.6rem'}}>
+                            A=${e.a.toString(16).toUpperCase().padStart(4,'0')}
+                            {e.rep > 1 && <span style={{color:'var(--muted)',marginLeft:'0.4rem'}}>×{e.rep.toLocaleString()}</span>}
+                          </span>
+                        </div>
+                      );
+                    })}
+                  </div>
+                  <div style={{fontFamily:"'JetBrains Mono'",fontSize:'0.6rem',color:'var(--muted)',marginTop:'0.5rem'}}>
+                    APU OUT: {dbgSnap?.apuOut?.map((b,i)=><span key={i} style={{marginRight:'0.5rem',color:'var(--teal)'}}>P{i}=${b.toString(16).toUpperCase().padStart(2,'0')}</span>)}
+                    &nbsp;·&nbsp;
+                    APU IN: {dbgSnap?.apuIn?.map((b,i)=><span key={i} style={{marginRight:'0.5rem',color:'var(--amber)'}}>P{i}=${b.toString(16).toUpperCase().padStart(2,'0')}</span>)}
+                  </div>
+                  {dbgSnap?.spc && (
+                    <div style={{fontFamily:"'JetBrains Mono'",fontSize:'0.6rem',color:'var(--muted)',marginTop:'0.3rem'}}>
+                      SPC700 — PC:${dbgSnap.spc.pc.toString(16).toUpperCase().padStart(4,'0')}
+                      &nbsp;A:${dbgSnap.spc.a.toString(16).toUpperCase().padStart(2,'0')}
+                      &nbsp;X:${dbgSnap.spc.x.toString(16).toUpperCase().padStart(2,'0')}
+                      &nbsp;Y:${dbgSnap.spc.y.toString(16).toUpperCase().padStart(2,'0')}
+                      &nbsp;SP:${dbgSnap.spc.sp.toString(16).toUpperCase().padStart(2,'0')}
+                      &nbsp;cycles:{dbgSnap.spc.cycles.toLocaleString()}
+                    </div>
+                  )}
+                </div>
+              )}
+
+              {/* ── Event Log tab ── */}
+              {dbgTab==='log' && (
+                <div className="dbg-log">
+                  {eventLog.length===0 && (
+                    <div style={{color:'var(--muted)',fontStyle:'italic'}}>Events will appear here as the game runs...</div>
+                  )}
+                  {eventLog.map(e=>(
+                    <div className="dbg-log-row" key={e.id}>
+                      <span className="dbg-log-ts">{e.ts}</span>
+                      <span className={`dbg-log-tag ${e.tag}`}>{e.tag.toUpperCase()}</span>
+                      <span className="dbg-log-msg">{e.msg}</span>
+                    </div>
+                  ))}
+                </div>
+              )}
+
+            </div>
+          </div>
+        )}
+      </div>
+
+    </div>
+  );
+}
+
+
+    const root = ReactDOM.createRoot(document.getElementById('root'));
+    root.render(<SNESEmulator />);
+  </script>
+</body>
+</html>
