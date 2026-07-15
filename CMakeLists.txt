@@ -64,6 +64,48 @@ set(ALL_SOURCES ${CORE_SOURCES} ${SDK_SOURCES})
 
 # ── Target ───────────────────────────────────────────────────────────────────
 if(EMSCRIPTEN)
+    # Every function declared in ding_core.h must appear here or Emscripten's
+    # linker dead-strips it — nothing in our C++ calls these, only JS does.
+    set(EXPORTED_FUNCTIONS
+        "_ding_init"
+        "_ding_destroy"
+        "_ding_reset"
+        "_ding_run_frame"
+        "_ding_load_rom"
+        "_ding_load_disc"
+        "_ding_load_bios"
+        "_ding_is_disc_swap_pending"
+        "_ding_swap_disc"
+        "_ding_get_core_info"
+        "_ding_get_video_info"
+        "_ding_get_audio_info"
+        "_ding_get_rom_identity"
+        "_ding_get_savestate_info"
+        "_ding_get_memory_region_count"
+        "_ding_get_memory_region"
+        "_ding_get_bios_count"
+        "_ding_get_bios_descriptor"
+        "_ding_get_input_descriptor_count"
+        "_ding_get_input_descriptor"
+        "_ding_get_framebuffer"
+        "_ding_get_current_dimensions"
+        "_ding_get_audio_sample_count"
+        "_ding_read_audio_samples"
+        "_ding_set_button"
+        "_ding_set_axis"
+        "_ding_save_state"
+        "_ding_load_state"
+        "_ding_set_region"
+        "_ding_diag_cpu_state"
+        "_ding_diag_video_state"
+        "_ding_has_error"
+        "_ding_diag_last_error"
+        "_malloc"
+        "_free"
+    )
+    string(JOIN "," EXPORTED_FUNCTIONS_CSV ${EXPORTED_FUNCTIONS})
+    set(EXPORTED_FUNCTIONS_STR "[${EXPORTED_FUNCTIONS_CSV}]")
+
     # Single WASM+JS glue output. MODULARIZE lets the frontend `await
     # createDingSnesCore()` instead of polluting the global scope — matches
     # how genesis-core/gameboy-core's WASM builds are consumed already.
@@ -72,10 +114,14 @@ if(EMSCRIPTEN)
         "SHELL:-s WASM=1"
         "SHELL:-s MODULARIZE=1"
         "SHELL:-s EXPORT_NAME=createDingSnesCore"
-        "SHELL:-s EXPORTED_RUNTIME_METHODS=['ccall','cwrap']"
         "SHELL:-s ALLOW_MEMORY_GROWTH=1"
+        "SHELL:-s NO_EXIT_RUNTIME=1"
         "SHELL:-s ENVIRONMENT=web"
+        "SHELL:-s EXPORTED_RUNTIME_METHODS=['ccall','cwrap','getValue','setValue','HEAPU8']"
+        "SHELL:-s EXPORTED_FUNCTIONS=${EXPORTED_FUNCTIONS_STR}"
+        --no-entry
     )
+    set_target_properties(ding_snes_core PROPERTIES SUFFIX ".js")
 else()
     add_library(ding_snes_core SHARED ${ALL_SOURCES})
     set_target_properties(ding_snes_core PROPERTIES
