@@ -34,6 +34,16 @@ public:
     bool hiROM   = false;
     bool exHiROM = false;
 
+    // Post copier-header-strip ROM bytes — exactly what RetroAchievements
+    // hashes for SNES (see header-detection rule in the .cpp). Use this,
+    // not the original file buffer, when computing ROM identity.
+    const std::vector<uint8_t>& romBytes() const { return rom; }
+
+    // Battery SRAM — empty if the cartridge has none. Save-state and
+    // battery-save (.srm) code both go through these.
+    std::vector<uint8_t>&       sramBytes()       { return sram; }
+    const std::vector<uint8_t>& sramBytes() const { return sram; }
+
 private:
     // Score a candidate header at a ROM file offset. Higher = more likely real.
     int headerScore(uint32_t offset) const;

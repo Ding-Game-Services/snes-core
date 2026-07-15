@@ -92,18 +92,21 @@ public:
 
     uint8_t openBus = 0;
 
+    // Serial joypad latch ($4016 strobe, $4016/$4017 serial reads).
+    // Public so save-state serialization can reach it directly.
+    bool    joyStrobe = false;
+    uint8_t joyBit1 = 0, joyBit2 = 0;
+
 private:
-    uint8_t internalRead(uint16_t addr);
-    void    internalWrite(uint16_t addr, uint8_t val);
+    uint8_t internalRead(uint8_t bank, uint16_t addr);
+    void    internalWrite(uint8_t bank, uint16_t addr, uint8_t val);
+    uint8_t internalRegRead(uint16_t addr);   // $4200–$44FF reads
+    void    internalRegWrite(uint16_t addr, uint8_t val); // $4200–$44FF writes
     uint8_t wramPortRead();
     void    wramPortWrite(uint8_t val);
     void    runDMA();
 
     Cartridge& cart;
-
-    // Serial joypad latch ($4016 strobe, $4016/$4017 serial reads)
-    bool    joyStrobe = false;
-    uint8_t joyBit1 = 0, joyBit2 = 0;
 };
 
 } // namespace ding::snes
