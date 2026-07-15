@@ -117,7 +117,7 @@ if(EMSCRIPTEN)
         "SHELL:-s ALLOW_MEMORY_GROWTH=1"
         "SHELL:-s NO_EXIT_RUNTIME=1"
         "SHELL:-s ENVIRONMENT=web"
-        "SHELL:-s EXPORTED_RUNTIME_METHODS=['ccall','cwrap','getValue','setValue','HEAPU8']"
+        "SHELL:-s EXPORTED_RUNTIME_METHODS=['ccall','cwrap','getValue','setValue','HEAPU8','UTF8ToString']"
         "SHELL:-s EXPORTED_FUNCTIONS=${EXPORTED_FUNCTIONS_STR}"
         --no-entry
     )
