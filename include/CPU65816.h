@@ -31,7 +31,15 @@ public:
     bool stopped = false, waiting = false;
     uint64_t cycles = 0;
 
-    std::vector<uint16_t> pcHistory; // ring buffer for diagnostics
+    struct TraceEntry { uint8_t bank; uint16_t pc; uint8_t op; };
+    std::vector<TraceEntry> pcTrace;      // ring buffer, matches JS pcTrace
+    std::vector<uint32_t>   pcHistory;    // ring buffer of (PBR<<16)|PC, matches JS pcHistory
+
+    struct Snapshot {
+        uint16_t pc; uint16_t a, x, y, sp, dp;
+        uint8_t  pbr, dbr, p; bool e; uint64_t cycles;
+    };
+    Snapshot snapshot() const;
 
     // ── Status flag accessors (P register bits) ──────────────────────────
     bool fN() const { return P & 0x80; }
@@ -101,6 +109,26 @@ private:
     // ── Arithmetic helpers ─────────────────────────────────────────────────
     void adc(uint32_t val);
     void sbc(uint32_t val);
+
+    // Shift/rotate ops. JS used ea===null to mean "operate on register A";
+    // kRegA is the equivalent sentinel here since 0xFFFFFF is out of address range.
+    static constexpr uint32_t kRegA = 0xFFFFFFFF;
+    void shiftOp(uint32_t ea, int kind); // kind: 0=asl 1=lsr 2=rol 3=ror
+    void asl_reg() { shiftOp(kRegA, 0); }
+    void lsr_reg() { shiftOp(kRegA, 1); }
+    void rol_reg() { shiftOp(kRegA, 2); }
+    void ror_reg() { shiftOp(kRegA, 3); }
+    void asl_mem(uint32_t ea) { shiftOp(ea, 0); }
+    void lsr_mem(uint32_t ea) { shiftOp(ea, 1); }
+    void rol_mem(uint32_t ea) { shiftOp(ea, 2); }
+    void ror_mem(uint32_t ea) { shiftOp(ea, 3); }
+
+    int  branch(bool taken);
+    void doNMI();
+    void doIRQ();
+
+    int _lastTracedPC = -1;
+    int _lastTracePc  = -1;
 
     Bus& bus;
 };

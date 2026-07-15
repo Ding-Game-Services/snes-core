@@ -62,9 +62,31 @@ public:
     // ARGB8888 framebuffer, kScreenW * kScreenH
     std::vector<uint32_t> pixels;
 
+    struct Snapshot {
+        uint32_t frame; int scanline; bool vblank;
+        uint8_t  mode; bool bg3hi; uint8_t tm; uint8_t inidisp;
+    };
+    Snapshot ppuSnapshot() const;
+
 private:
     uint32_t toARGB(uint16_t bgr15) const;
     void     prefetchVRAM();
+
+    // One rendered background/sprite pixel: cgi = CGRAM color index, prio = priority bit.
+    // `valid` mirrors the JS `out[x] === null` (no opaque pixel at this x).
+    struct Px { uint8_t cgi = 0; uint8_t prio = 0; bool valid = false; };
+
+    std::array<Px, kScreenW> bgLine(int bg, int y, int bpp);
+    std::array<Px, kScreenW> m7Line(int y);
+    std::array<Px, kScreenW> sprLine(int y);
+
+    // layers(): each entry is {isSprite(0/1), bgIndex, priority}
+    struct LayerEntry { int isSprite; int idx; int prio; };
+    std::vector<LayerEntry> layers(int mode) const;
+
+    std::array<uint8_t, kScreenW> buildWinMask(int layer) const;
+    uint16_t blendC(uint16_t main, uint16_t sub, int op, bool half) const;
+    void     renderScanline(int y);
 
     friend class Bus; // needs regRead/regWrite passthrough
 };
