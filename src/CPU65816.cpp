@@ -69,11 +69,11 @@ uint32_t CPU65816::amAbY() { return (static_cast<uint32_t>(DBR) << 16) | ((f16()
 uint32_t CPU65816::amLng() { return f24(); }
 uint32_t CPU65816::amLnX() { return (f24() + X) & 0xFFFFFF; }
 uint32_t CPU65816::amSR()  { uint8_t o = f8(); return (SP + o) & 0xFFFF; }
-uint32_t CPU65816::amDPI()  { uint32_t ea = amDP(); return (static_cast<uint32_t>(DBR) << 16) | r16(0, ea); }
+uint32_t CPU65816::amDPI()  { uint32_t ea = amDP(); return (static_cast<uint32_t>(DBR) << 16) | r16(0, static_cast<uint16_t>(ea)); }
 uint32_t CPU65816::amDPIX() { uint8_t d = f8(); uint16_t ptr = (DP + d + X) & 0xFFFF; return (static_cast<uint32_t>(DBR) << 16) | r16(0, ptr); }
-uint32_t CPU65816::amDPIY() { uint32_t ea = amDP(); return (static_cast<uint32_t>(DBR) << 16) | ((r16(0, ea) + Y) & 0xFFFF); }
-uint32_t CPU65816::amDPIL() { uint32_t ea = amDP(); return r24(0, ea); }
-uint32_t CPU65816::amDPILY(){ uint32_t ea = amDP(); return (r24(0, ea) + Y) & 0xFFFFFF; }
+uint32_t CPU65816::amDPIY() { uint32_t ea = amDP(); return (static_cast<uint32_t>(DBR) << 16) | ((r16(0, static_cast<uint16_t>(ea)) + Y) & 0xFFFF); }
+uint32_t CPU65816::amDPIL() { uint32_t ea = amDP(); return r24(0, static_cast<uint16_t>(ea)); }
+uint32_t CPU65816::amDPILY(){ uint32_t ea = amDP(); return (r24(0, static_cast<uint16_t>(ea)) + Y) & 0xFFFFFF; }
 uint32_t CPU65816::amSRIY() { uint16_t ptr = (SP + f8()) & 0xFFFF; return (static_cast<uint32_t>(DBR) << 16) | ((r16(0, ptr) + Y) & 0xFFFF); }
 uint32_t CPU65816::amImmM() { uint32_t a = (static_cast<uint32_t>(PBR) << 16) | PC; PC = (PC + (fM() ? 1 : 2)) & 0xFFFF; return a; }
 uint32_t CPU65816::amImmX() { uint32_t a = (static_cast<uint32_t>(PBR) << 16) | PC; PC = (PC + (fX() ? 1 : 2)) & 0xFFFF; return a; }
@@ -230,7 +230,7 @@ int CPU65816::step() {
         case 0x0B: ph16(DP); cy = 4; break;
         case 0x4B: ph8(PBR); cy = 3; break;
         case 0xF4: ph16(f16()); cy = 5; break;
-        case 0xD4: ph16(r16(0, amDP())); cy = 6; break;
+        case 0xD4: ph16(r16(0, static_cast<uint16_t>(amDP()))); cy = 6; break;
         case 0x62: { uint16_t o = f16(); ph16((PC + (o < 0x8000 ? o : o - 0x10000)) & 0xFFFF); cy = 6; break; }
         case 0x68: { auto v = fM() ? pl8() : pl16(); A = fM() ? (A & 0xFF00) | (v & 0xFF) : (v & 0xFFFF); nzM(A); cy = 4; break; }
         case 0xFA: { X = fX() ? pl8() : pl16(); nzX(X); cy = 4; break; }
@@ -434,16 +434,16 @@ int CPU65816::step() {
         case 0x6E: { uint32_t a = amAbs(); ror_mem(a); cy = 6; break; }
         case 0x7E: { uint32_t a = amAbX(); ror_mem(a); cy = 7; break; }
 
-        case 0x1A: { uint32_t v = fM() ? (((A & 0xFF) + 1) & 0xFF) : ((A + 1) & 0xFFFF); A = fM() ? (A & 0xFF00) | v : v; nzM(A); cy = 2; break; }
-        case 0x3A: { uint32_t v = fM() ? (((A & 0xFF) - 1) & 0xFF) : ((A - 1) & 0xFFFF); A = fM() ? (A & 0xFF00) | v : v; nzM(A); cy = 2; break; }
-        case 0xE6: { uint32_t a = amDP();  uint32_t v = (rdM(a) + 1) & (fM() ? 0xFF : 0xFFFF); wrM(a, v); nzM(v); cy = 5; break; }
-        case 0xF6: { uint32_t a = amDPX(); uint32_t v = (rdM(a) + 1) & (fM() ? 0xFF : 0xFFFF); wrM(a, v); nzM(v); cy = 6; break; }
-        case 0xEE: { uint32_t a = amAbs(); uint32_t v = (rdM(a) + 1) & (fM() ? 0xFF : 0xFFFF); wrM(a, v); nzM(v); cy = 6; break; }
-        case 0xFE: { uint32_t a = amAbX(); uint32_t v = (rdM(a) + 1) & (fM() ? 0xFF : 0xFFFF); wrM(a, v); nzM(v); cy = 7; break; }
-        case 0xC6: { uint32_t a = amDP();  uint32_t v = (rdM(a) - 1) & (fM() ? 0xFF : 0xFFFF); wrM(a, v); nzM(v); cy = 5; break; }
-        case 0xD6: { uint32_t a = amDPX(); uint32_t v = (rdM(a) - 1) & (fM() ? 0xFF : 0xFFFF); wrM(a, v); nzM(v); cy = 6; break; }
-        case 0xCE: { uint32_t a = amAbs(); uint32_t v = (rdM(a) - 1) & (fM() ? 0xFF : 0xFFFF); wrM(a, v); nzM(v); cy = 6; break; }
-        case 0xDE: { uint32_t a = amAbX(); uint32_t v = (rdM(a) - 1) & (fM() ? 0xFF : 0xFFFF); wrM(a, v); nzM(v); cy = 7; break; }
+        case 0x1A: { uint32_t v = fM() ? (((A & 0xFF) + 1) & 0xFF) : ((A + 1) & 0xFFFF); A = static_cast<uint16_t>(fM() ? (A & 0xFF00) | v : v); nzM(A); cy = 2; break; }
+        case 0x3A: { uint32_t v = fM() ? (((A & 0xFF) - 1) & 0xFF) : ((A - 1) & 0xFFFF); A = static_cast<uint16_t>(fM() ? (A & 0xFF00) | v : v); nzM(A); cy = 2; break; }
+        case 0xE6: { uint32_t a = amDP();  uint32_t v = (rdM(a) + 1) & (fM() ? 0xFF : 0xFFFF); wrM(a, static_cast<uint16_t>(v)); nzM(v); cy = 5; break; }
+        case 0xF6: { uint32_t a = amDPX(); uint32_t v = (rdM(a) + 1) & (fM() ? 0xFF : 0xFFFF); wrM(a, static_cast<uint16_t>(v)); nzM(v); cy = 6; break; }
+        case 0xEE: { uint32_t a = amAbs(); uint32_t v = (rdM(a) + 1) & (fM() ? 0xFF : 0xFFFF); wrM(a, static_cast<uint16_t>(v)); nzM(v); cy = 6; break; }
+        case 0xFE: { uint32_t a = amAbX(); uint32_t v = (rdM(a) + 1) & (fM() ? 0xFF : 0xFFFF); wrM(a, static_cast<uint16_t>(v)); nzM(v); cy = 7; break; }
+        case 0xC6: { uint32_t a = amDP();  uint32_t v = (rdM(a) - 1) & (fM() ? 0xFF : 0xFFFF); wrM(a, static_cast<uint16_t>(v)); nzM(v); cy = 5; break; }
+        case 0xD6: { uint32_t a = amDPX(); uint32_t v = (rdM(a) - 1) & (fM() ? 0xFF : 0xFFFF); wrM(a, static_cast<uint16_t>(v)); nzM(v); cy = 6; break; }
+        case 0xCE: { uint32_t a = amAbs(); uint32_t v = (rdM(a) - 1) & (fM() ? 0xFF : 0xFFFF); wrM(a, static_cast<uint16_t>(v)); nzM(v); cy = 6; break; }
+        case 0xDE: { uint32_t a = amAbX(); uint32_t v = (rdM(a) - 1) & (fM() ? 0xFF : 0xFFFF); wrM(a, static_cast<uint16_t>(v)); nzM(v); cy = 7; break; }
         case 0xE8: X = (X + 1) & (fX() ? 0xFF : 0xFFFF); nzX(X); break;
         case 0xC8: Y = (Y + 1) & (fX() ? 0xFF : 0xFFFF); nzX(Y); break;
         case 0xCA: X = (X - 1) & (fX() ? 0xFF : 0xFFFF); nzX(X); break;
@@ -568,8 +568,8 @@ void CPU65816::shiftOp(uint32_t ea, int kind) {
             break;
         }
     }
-    if (onReg) { A = fM() ? (A & 0xFF00) | v : v; nzM(A); }
-    else       { wrM(ea, v); nzM(v); }
+    if (onReg) { A = static_cast<uint16_t>(fM() ? (A & 0xFF00) | v : v); nzM(A); }
+    else       { wrM(ea, static_cast<uint16_t>(v)); nzM(v); }
 }
 
 CPU65816::Snapshot CPU65816::snapshot() const {

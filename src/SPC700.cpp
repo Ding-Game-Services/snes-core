@@ -373,7 +373,7 @@ int SPC700::step() {
         case 0x7F: { uint8_t lo = pop(), hi = pop(); PC = (hi << 8) | lo; setP(pop()); cy = 6; break; }
         case 0x01: case 0x11: case 0x21: case 0x31: case 0x41: case 0x51: case 0x61: case 0x71:
         case 0x81: case 0x91: case 0xA1: case 0xB1: case 0xC1: case 0xD1: case 0xE1: case 0xF1: {
-            int n = op >> 4; uint16_t vec = 0xFFDE - (n * 2);
+            int n = op >> 4; uint16_t vec = static_cast<uint16_t>(0xFFDE - (n * 2));
             push((PC >> 8) & 0xFF); push(PC & 0xFF);
             PC = (rd((vec + 1) & 0xFFFF) << 8) | rd(vec & 0xFFFF); cy = 8; break;
         }

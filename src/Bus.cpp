@@ -253,7 +253,7 @@ void Bus::runDMA() {
         uint32_t pi = 0;
 
         while (count-- > 0) {
-            uint16_t destAddr = 0x2100 | c.destReg | pattern[pi % patLen];
+            uint16_t destAddr = static_cast<uint16_t>(0x2100 | c.destReg | pattern[pi % patLen]);
             pi++;
             if (toWRAM) {
                 write(src, read(destAddr));
@@ -325,7 +325,7 @@ void Bus::hdmaRun() {
 
         int lo7 = (c.lineCounter & 0x7F) - 1;
         if (lo7 > 0) {
-            c.lineCounter = (c.lineCounter & 0x80) | lo7;
+            c.lineCounter = static_cast<uint8_t>((c.lineCounter & 0x80) | lo7);
         } else {
             c.lineCounter = read((c.tableBank << 16) | c.tableAddr);
             c.tableAddr   = (c.tableAddr + 1) & 0xFFFF;
