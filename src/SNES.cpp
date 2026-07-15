@@ -6,7 +6,6 @@
 namespace ding::snes {
 
 namespace {
-std::string h2(uint8_t v) { char buf[8]; std::snprintf(buf, sizeof(buf), "$%02X", v); return buf; }
 std::string h4(uint16_t v) { char buf[8]; std::snprintf(buf, sizeof(buf), "$%04X", v); return buf; }
 }
 

@@ -13,8 +13,13 @@ constexpr uint32_t kExHiROMBase = 0x40FFC0;
 }
 
 Cartridge::Cartridge(const std::vector<uint8_t>& data) {
-    // Strip 512-byte copier header when present (size mod 1024 == 512)
-    bool hasHeader = (data.size() & 0x3FF) == 0x200;
+    // RetroAchievements SNES header rule: a copier header is present iff the
+    // file size is exactly 512 bytes more than a multiple of 8KB. Any other
+    // size (including no remainder, or a different remainder) is unheadered.
+    // This must stay in sync with whatever ding_get_rom_identity() hashes —
+    // romBytes() below returns the post-strip buffer, so hashing romBytes()
+    // directly reproduces RA's MD5 for both mapping and achievement lookup.
+    bool hasHeader = (data.size() % 8192u) == 512u;
     rom.assign(data.begin() + (hasHeader ? 0x200 : 0), data.end());
 
     int loScore = headerScore(kLoROMBase);
@@ -115,7 +120,7 @@ uint8_t Cartridge::read(uint8_t bank, uint16_t addr) const {
 
     // ── HiROM ──────────────────────────────────────────────────────────────
     if (hiROM) {
-        if ((b >= 0x40 && b <= 0x7D) || (b >= 0xC0 && b <= 0xFF))
+        if ((b >= 0x40 && b <= 0x7D) || b >= 0xC0)
             return rom[((b & 0x3F) * 0x10000u + a) % rom.size()];
         if (a >= 0x8000)
             return rom[((b & 0x3F) * 0x10000u + a) % rom.size()];
@@ -132,7 +137,7 @@ uint8_t Cartridge::read(uint8_t bank, uint16_t addr) const {
         uint32_t off = ((b & 0x7F) * 0x8000u) + (a - 0x8000);
         return rom[off % rom.size()];
     }
-    if (!sram.empty() && ((b >= 0x70 && b <= 0x7D) || (b >= 0xF0 && b <= 0xFF))) {
+    if (!sram.empty() && ((b >= 0x70 && b <= 0x7D) || b >= 0xF0)) {
         int bankBase = b >= 0xF0 ? b - 0xF0 : b - 0x70;
         uint32_t off = (bankBase * 0x8000u) + a;
         return sram[off % sram.size()];
@@ -152,7 +157,7 @@ void Cartridge::write(uint8_t bank, uint16_t addr, uint8_t val) {
             if (off < sram.size()) sram[off] = val;
         }
     } else {
-        if ((b >= 0x70 && b <= 0x7D) || (b >= 0xF0 && b <= 0xFF)) {
+        if ((b >= 0x70 && b <= 0x7D) || b >= 0xF0) {
             int bankBase = b >= 0xF0 ? b - 0xF0 : b - 0x70;
             uint32_t off = (bankBase * 0x8000u) + a;
             if (off < sram.size()) sram[off] = val;
