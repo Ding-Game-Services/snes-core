@@ -235,9 +235,12 @@ void Bus::internalRegWrite(uint16_t addr, uint8_t val) {
 void Bus::runDMA() {
     static constexpr int PATTERNS[8][4] = {
         {0,-1,-1,-1}, {0,1,-1,-1}, {0,0,-1,-1}, {0,0,1,1},
-        {0,1,2,3},    {0,1,-1,-1}, {0,0,-1,-1}, {0,0,1,1},
+        {0,1,2,3},    {0,1,0,1},   {0,0,-1,-1}, {0,0,1,1},
     };
-    static constexpr int PATTERN_LEN[8] = {1,2,2,4,4,2,2,4};
+    // Mode 5 is 4 bytes cycling [0,1,0,1] (two ports, alternating, twice per
+    // unit) — was previously truncated to len=2, corrupting every 3rd/4th
+    // byte of any mode-5 transfer (VRAM/CGRAM uploads commonly use this mode).
+    static constexpr int PATTERN_LEN[8] = {1,2,2,4,4,4,2,4};
 
     for (int ch = 0; ch < 8; ch++) {
         if (!(mdmaen & (1 << ch))) continue;
@@ -297,9 +300,12 @@ void Bus::hdmaInit() {
 void Bus::hdmaRun() {
     static constexpr int PATTERNS[8][4] = {
         {0,-1,-1,-1}, {0,1,-1,-1}, {0,0,-1,-1}, {0,0,1,1},
-        {0,1,2,3},    {0,1,-1,-1}, {0,0,-1,-1}, {0,0,1,1},
+        {0,1,2,3},    {0,1,0,1},   {0,0,-1,-1}, {0,0,1,1},
     };
-    static constexpr int PATTERN_LEN[8] = {1,2,2,4,4,2,2,4};
+    // Mode 5 is 4 bytes cycling [0,1,0,1] (two ports, alternating, twice per
+    // unit) — was previously truncated to len=2, corrupting every 3rd/4th
+    // byte of any mode-5 transfer (VRAM/CGRAM uploads commonly use this mode).
+    static constexpr int PATTERN_LEN[8] = {1,2,2,4,4,4,2,4};
 
     for (int ch = 0; ch < 8; ch++) {
         if (!(hdmaen & (1 << ch))) continue;

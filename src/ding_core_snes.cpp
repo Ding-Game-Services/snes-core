@@ -161,7 +161,7 @@ const DingSaveStateInfo* ding_get_savestate_info() {
 
 uint32_t ding_get_memory_region_count() {
     if (!g_snes) return 0;
-    uint32_t n = 4; // WRAM, VRAM, CGRAM, OAM
+    uint32_t n = 5; // WRAM, VRAM, CGRAM, OAM, PPU Regs
     if (!g_cart->sramBytes().empty()) n++;
     return n;
 }
@@ -197,6 +197,16 @@ void ding_get_memory_region(uint32_t index, DingMemoryRegion* out) {
             out->writable = 1;
             break;
         case 4:
+            // Raw $2100-$213F register file — BGnSC/NBA/BGnHOFS etc. live here.
+            // Read-only: writing through this pointer skips regWrite()'s side
+            // effects (VRAM port latching, CGRAM auto-increment, etc), so it's
+            // diagnostic-only, not a real write path.
+            out->name = "PPU Regs ($2100-213F)"; out->base_addr = 0x2100;
+            out->size = g_snes->ppu.regs.size();
+            out->access = DING_MEM_DIRECT; out->ptr = g_snes->ppu.regs.data();
+            out->writable = 0;
+            break;
+        case 5:
             if (g_cart && !g_cart->sramBytes().empty()) {
                 out->name = "Cart SRAM"; out->base_addr = 0;
                 out->size = g_cart->sramBytes().size();
@@ -476,7 +486,22 @@ size_t ding_diag_cpu_state(char* buf, size_t buf_size) {
         c.PBR, c.PC, c.A, c.X, c.Y, c.SP, c.DP, c.DBR, c.P, c.E ? 1 : 0,
         c.pendingNMI ? 1 : 0, c.pendingIRQ ? 1 : 0, c.stopped ? 1 : 0, c.waiting ? 1 : 0,
         static_cast<unsigned long long>(c.cycles));
-    return n < 0 ? 0 : static_cast<size_t>(n);
+    if (n < 0) return 0;
+    size_t used = static_cast<size_t>(n);
+
+    // Append the last few distinct PCs so a frozen/looping CPU is visible
+    // directly in diag output instead of requiring step-by-step guesswork.
+    if (!c.pcTrace.empty() && used < buf_size) {
+        int written = std::snprintf(buf + used, buf_size - used, " | trace:");
+        if (written > 0) used += static_cast<size_t>(written);
+        size_t start = c.pcTrace.size() > 8 ? c.pcTrace.size() - 8 : 0;
+        for (size_t i = start; i < c.pcTrace.size() && used < buf_size; i++) {
+            const auto& t = c.pcTrace[i];
+            written = std::snprintf(buf + used, buf_size - used, " %02X:%04X(%02X)", t.bank, t.pc, t.op);
+            if (written > 0) used += static_cast<size_t>(written);
+        }
+    }
+    return used < buf_size ? used : buf_size - 1;
 }
 
 size_t ding_diag_video_state(char* buf, size_t buf_size) {

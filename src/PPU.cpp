@@ -235,8 +235,8 @@ std::array<PPU::Px, kScreenW> PPU::sprLine(int y) {
         {16,16,64,64}, {32,32,64,64}, {16,32,32,64}, {16,32,32,64},
     };
     const int* sz = SZ[obsel & 7];
-    int nb0 = ((obsel >> 3) & 3) * 0x1000;
-    int nb1 = nb0 + ((((obsel >> 5) & 7) + 1) << 11);
+    int nb0 = ((obsel >> 5) & 7) << 12;
+    int nb1 = nb0 + ((((obsel >> 3) & 3) + 1) << 12);
     int count = 0;
 
     for (int s = 0; s < 128; s++) {

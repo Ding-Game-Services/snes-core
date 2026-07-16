@@ -80,14 +80,49 @@ uint32_t CPU65816::amImmX() { uint32_t a = (static_cast<uint32_t>(PBR) << 16) | 
 
 // ── Arithmetic ────────────────────────────────────────────────────────────────
 void CPU65816::adc(uint32_t val) {
+    bool carry = fC();
+    if (fD()) {
+        if (fM()) {
+            int32_t a = A & 0xFF, v = val & 0xFF;
+            int32_t r = (a & 0x0F) + (v & 0x0F) + (carry ? 1 : 0);
+            if (r > 0x09) r += 0x06;
+            bool c1 = r > 0x0F;
+            r = (a & 0xF0) + (v & 0xF0) + (c1 ? 0x10 : 0) + (r & 0x0F);
+            sV((~(a ^ v) & (a ^ r) & 0x80) != 0);
+            if (r > 0x9F) r += 0x60;
+            bool cOut = r > 0xFF;
+            uint8_t result = static_cast<uint8_t>(r);
+            A = (A & 0xFF00) | result;
+            sN((result & 0x80) != 0); sZ(result == 0); sC(cOut);
+        } else {
+            int32_t a = A & 0xFFFF, v = val & 0xFFFF;
+            int32_t r = (a & 0x000F) + (v & 0x000F) + (carry ? 1 : 0);
+            if (r > 0x0009) r += 0x0006;
+            bool c1 = r > 0x000F;
+            r = (a & 0x00F0) + (v & 0x00F0) + (c1 ? 0x0010 : 0) + (r & 0x000F);
+            if (r > 0x009F) r += 0x0060;
+            bool c2 = r > 0x00FF;
+            r = (a & 0x0F00) + (v & 0x0F00) + (c2 ? 0x0100 : 0) + (r & 0x00FF);
+            if (r > 0x09FF) r += 0x0600;
+            bool c3 = r > 0x0FFF;
+            r = (a & 0xF000) + (v & 0xF000) + (c3 ? 0x1000 : 0) + (r & 0x0FFF);
+            sV((~(a ^ v) & (a ^ r) & 0x8000) != 0);
+            if (r > 0x9FFF) r += 0x6000;
+            bool cOut = r > 0xFFFF;
+            uint16_t result = static_cast<uint16_t>(r);
+            A = result;
+            sN((result & 0x8000) != 0); sZ(result == 0); sC(cOut);
+        }
+        return;
+    }
     if (fM()) {
-        uint32_t a = A & 0xFF, r = a + (val & 0xFF) + (fC() ? 1 : 0);
+        uint32_t a = A & 0xFF, r = a + (val & 0xFF) + (carry ? 1 : 0);
         sV((~(a ^ val) & (a ^ r) & 0x80) != 0);
         sC(r > 0xFF);
         A = (A & 0xFF00) | (r & 0xFF);
         nzM(A);
     } else {
-        uint32_t a = A & 0xFFFF, r = a + (val & 0xFFFF) + (fC() ? 1 : 0);
+        uint32_t a = A & 0xFFFF, r = a + (val & 0xFFFF) + (carry ? 1 : 0);
         sV((~(a ^ val) & (a ^ r) & 0x8000) != 0);
         sC(r > 0xFFFF);
         A = r & 0xFFFF;
@@ -95,14 +130,49 @@ void CPU65816::adc(uint32_t val) {
     }
 }
 void CPU65816::sbc(uint32_t val) {
+    bool carry = fC();
+    if (fD()) {
+        if (fM()) {
+            int32_t a = A & 0xFF, v = val & 0xFF;
+            int32_t r = (a & 0x0F) - (v & 0x0F) - (carry ? 0 : 1);
+            if (r < 0) r -= 0x06;
+            bool c1 = r >= 0;
+            r = (a & 0xF0) - (v & 0xF0) - (c1 ? 0 : 0x10) + (r & 0x0F);
+            sV(((a ^ v) & (a ^ r) & 0x80) != 0);
+            if (r < 0) r -= 0x60;
+            bool cOut = r >= 0;
+            uint8_t result = static_cast<uint8_t>(r & 0xFF);
+            A = (A & 0xFF00) | result;
+            sN((result & 0x80) != 0); sZ(result == 0); sC(cOut);
+        } else {
+            int32_t a = A & 0xFFFF, v = val & 0xFFFF;
+            int32_t r = (a & 0x000F) - (v & 0x000F) - (carry ? 0 : 1);
+            if (r < 0) r -= 0x0006;
+            bool c1 = r >= 0;
+            r = (a & 0x00F0) - (v & 0x00F0) - (c1 ? 0 : 0x0010) + (r & 0x000F);
+            if (r < 0) r -= 0x0060;
+            bool c2 = r >= 0;
+            r = (a & 0x0F00) - (v & 0x0F00) - (c2 ? 0 : 0x0100) + (r & 0x00FF);
+            if (r < 0) r -= 0x0600;
+            bool c3 = r >= 0;
+            r = (a & 0xF000) - (v & 0xF000) - (c3 ? 0 : 0x1000) + (r & 0x0FFF);
+            sV(((a ^ v) & (a ^ r) & 0x8000) != 0);
+            if (r < 0) r -= 0x6000;
+            bool cOut = r >= 0;
+            uint16_t result = static_cast<uint16_t>(r & 0xFFFF);
+            A = result;
+            sN((result & 0x8000) != 0); sZ(result == 0); sC(cOut);
+        }
+        return;
+    }
     if (fM()) {
-        uint32_t a = A & 0xFF, v = val & 0xFF, r = a - v - (fC() ? 0 : 1);
+        uint32_t a = A & 0xFF, v = val & 0xFF, r = a - v - (carry ? 0 : 1);
         sV(((a ^ v) & (a ^ r) & 0x80) != 0);
         sC(static_cast<int32_t>(r) >= 0);
         A = (A & 0xFF00) | (r & 0xFF);
         nzM(A);
     } else {
-        uint32_t a = A & 0xFFFF, v = val & 0xFFFF, r = a - v - (fC() ? 0 : 1);
+        uint32_t a = A & 0xFFFF, v = val & 0xFFFF, r = a - v - (carry ? 0 : 1);
         sV(((a ^ v) & (a ^ r) & 0x8000) != 0);
         sC(static_cast<int32_t>(r) >= 0);
         A = r & 0xFFFF;
