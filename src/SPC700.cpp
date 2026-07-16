@@ -84,24 +84,6 @@ namespace {
 } // namespace
 
 int SPC700::step() {
-    // ── timer tick ─────────────────────────────────────────────────────────
-    {
-        static constexpr int thresh[3] = {128, 128, 16};
-        for (int i = 0; i < 3; i++) {
-            if (!timerEn[i]) continue;
-            timerCycles[i]++;
-            if (timerCycles[i] >= thresh[i]) {
-                timerCycles[i] = 0;
-                timerDiv[i] = (timerDiv[i] + 1) & 0xFF;
-                uint16_t target = timerTarget[i] ? timerTarget[i] : 0x100;
-                if (timerDiv[i] >= target) {
-                    timerDiv[i] = 0;
-                    timerOut[i] = (timerOut[i] + 1) & 0x0F;
-                }
-            }
-        }
-    }
-
     // ── local helpers (mirror JS private methods, closed over `this`) ──────
     auto push = [&](uint8_t v) { ram[0x100 + SP] = v & 0xFF; SP = (SP - 1) & 0xFF; };
     auto pop  = [&]() -> uint8_t { SP = (SP + 1) & 0xFF; return ram[0x100 + SP]; };
@@ -411,6 +393,26 @@ int SPC700::step() {
         case 0xFF: cy = 2; break;
         case 0xEF: cy = 2; break;
         default:   cy = 2; break;
+    }
+
+    // ── timer tick — advances by this instruction's actual cycle count, not
+    // by 1 per call, since real timers divide down from elapsed SPC clock
+    // cycles and instructions vary from 2 to 8+ cycles each.
+    {
+        static constexpr int thresh[3] = {128, 128, 16};
+        for (int i = 0; i < 3; i++) {
+            if (!timerEn[i]) continue;
+            timerCycles[i] += cy;
+            while (timerCycles[i] >= thresh[i]) {
+                timerCycles[i] -= thresh[i];
+                timerDiv[i] = (timerDiv[i] + 1) & 0xFF;
+                uint16_t target = timerTarget[i] ? timerTarget[i] : 0x100;
+                if (timerDiv[i] >= target) {
+                    timerDiv[i] = 0;
+                    timerOut[i] = (timerOut[i] + 1) & 0x0F;
+                }
+            }
+        }
     }
 
     cycles += cy;
