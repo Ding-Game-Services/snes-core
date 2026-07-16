@@ -229,14 +229,14 @@ std::array<PPU::Px, kScreenW> PPU::m7Line(int y) {
 
 std::array<PPU::Px, kScreenW> PPU::sprLine(int y) {
     std::array<Px, kScreenW> out{};
-    uint8_t obsel = regs[0x01];
-    static constexpr int SZ[8][4] = {
-        {8,8,16,16}, {8,8,32,32}, {8,8,64,64}, {16,16,32,32},
-        {16,16,64,64}, {32,32,64,64}, {16,32,32,64}, {16,32,32,64},
-    };
-    const int* sz = SZ[obsel & 7];
-    int nb0 = ((obsel >> 5) & 7) << 12;
-    int nb1 = nb0 + ((((obsel >> 3) & 3) + 1) << 12);
+uint8_t obsel = regs[0x01];
+static constexpr int SZ[8][4] = {
+    {8,8,16,16}, {8,8,32,32}, {8,8,64,64}, {16,16,32,32},
+    {16,16,64,64}, {32,32,64,64}, {16,32,32,64}, {16,32,32,64},
+};
+const int* sz = SZ[obsel & 7];
+int nb0 = ((obsel >> 5) & 7) << 13;
+int nb1 = nb0 + ((((obsel >> 3) & 3) + 1) << 12);
     int count = 0;
 
     for (int s = 0; s < 128; s++) {
