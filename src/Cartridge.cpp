@@ -125,8 +125,7 @@ uint8_t Cartridge::read(uint8_t bank, uint16_t addr) const {
         if (a >= 0x8000)
             return rom[((b & 0x3F) * 0x10000u + a) % rom.size()];
         if (!sram.empty() && a >= 0x6000 && a <= 0x7FFF) {
-            int bankIdx = b >= 0xA0 ? b - 0xA0 : b - 0x20;
-            uint32_t off = (bankIdx * 0x2000u) + (a - 0x6000);
+            uint32_t off = ((b & 0x1F) * 0x2000u) + (a - 0x6000);
             return sram[off % sram.size()];
         }
         return 0;
@@ -152,8 +151,7 @@ void Cartridge::write(uint8_t bank, uint16_t addr, uint8_t val) {
 
     if (hiROM || exHiROM) {
         if (a >= 0x6000 && a <= 0x7FFF) {
-            int bankIdx = b >= 0xA0 ? b - 0xA0 : b >= 0x20 ? b - 0x20 : 0;
-            uint32_t off = (bankIdx * 0x2000u) + (a - 0x6000);
+            uint32_t off = ((b & 0x1F) * 0x2000u) + (a - 0x6000);
             if (off < sram.size()) sram[off] = val;
         }
     } else {
