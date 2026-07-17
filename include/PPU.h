@@ -85,6 +85,11 @@ private:
     std::vector<LayerEntry> layers(int mode) const;
 
     std::array<uint8_t, kScreenW> buildWinMask(int layer) const;
+
+    // Offset-per-tile (mode 2/4/6): per-tile-column scroll overrides for
+    // BG1/BG2, sourced from BG3's tilemap. -1 in a field means "no override".
+    struct OptCol { int h = -1; int v = -1; };
+    std::array<OptCol, 2> optOffset(int tileCol) const; // [0]=BG1, [1]=BG2
     uint16_t blendC(uint16_t main, uint16_t sub, int op, bool half) const;
     void     renderScanline(int y);
 

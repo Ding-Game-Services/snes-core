@@ -513,6 +513,38 @@ size_t ding_diag_video_state(char* buf, size_t buf_size) {
     return n < 0 ? 0 : static_cast<size_t>(n);
 }
 
+size_t ding_diag_apu_state(char* buf, size_t buf_size) {
+    if (!buf || buf_size == 0 || !g_snes) return 0;
+    const SPC700& s = g_snes->spc;
+    const Bus& b = g_snes->bus;
+    size_t used = 0;
+int n = std::snprintf(buf, buf_size,
+        "spcPC=%04X A=%02X X=%02X Y=%02X SP=%02X cyc=%llu | out=%02X,%02X,%02X,%02X in=%02X,%02X,%02X,%02X",
+        s.PC, s.A, s.X, s.Y, s.SP, static_cast<unsigned long long>(s.cycles),
+        s.outPorts[0], s.outPorts[1], s.outPorts[2], s.outPorts[3],
+        s.inPorts[0], s.inPorts[1], s.inPorts[2], s.inPorts[3]);
+    if (n > 0) used = static_cast<size_t>(n);
+
+    int written = std::snprintf(buf + used, buf_size - used, " | pcTrace:");
+    if (written > 0) used += static_cast<size_t>(written);
+    for (size_t i = 0; i < s.pcTrace.size() && used < buf_size; i++) {
+        written = std::snprintf(buf + used, buf_size - used, " %04X", s.pcTrace[i]);
+        if (written > 0) used += static_cast<size_t>(written);
+    }
+
+    written = std::snprintf(buf + used, buf_size - used, " | log:");
+    if (written > 0) used += static_cast<size_t>(written);
+
+    size_t start = b.apuLog.size() > 20 ? b.apuLog.size() - 20 : 0;
+    for (size_t i = start; i < b.apuLog.size() && used < buf_size; i++) {
+        const auto& e = b.apuLog[i];
+        written = std::snprintf(buf + used, buf_size - used, " %c%d=%02X(A=%02X,x%d)",
+            e.dir, e.port, e.val, e.a, e.rep);
+        if (written > 0) used += static_cast<size_t>(written);
+    }
+    return used < buf_size ? used : buf_size - 1;
+}
+
 uint8_t ding_has_error() { return g_hasError ? 1 : 0; }
 
 const char* ding_diag_last_error() {

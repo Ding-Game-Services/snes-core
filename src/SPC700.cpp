@@ -415,7 +415,11 @@ int SPC700::step() {
         }
     }
 
-    cycles += cy;
+cycles += cy;
+    if (pcTrace.empty() || pcTrace.back() != PC) {
+        pcTrace.push_back(PC);
+        if (pcTrace.size() > 16) pcTrace.erase(pcTrace.begin());
+    }
     return cy;
 }
 

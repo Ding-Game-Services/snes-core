@@ -134,14 +134,12 @@ std::array<PPU::Px, kScreenW> PPU::bgLine(int bg, int y, int bpp) {
     int mapBase = ((bgSC >> 2) & 0x3F) << 10;
     int mapSzX  = (bgSC & 1) ? 64 : 32;
     int mapSzY  = (bgSC & 2) ? 64 : 32;
-    uint8_t nba     = regs[0x0B + (bg >> 1)];
+uint8_t nba     = regs[0x0B + (bg >> 1)];
     int charBase= ((bg & 1) ? (nba >> 4) : (nba & 0xF)) << 12;
     int wpt     = bpp == 2 ? 8 : bpp == 4 ? 16 : 32;
-    int effY    = (mY + bgV[bg]) & ((mapSzY << 3) - 1);
-    int tileRow = effY >> 3;
-    int pxRow   = effY & 7;
     int pgsW    = mapSzX == 64 ? 2 : 1;
     int mode    = regs[0x05] & 7;
+    bool optMode = (mode == 2 || mode == 4 || mode == 6) && (bg == 0 || bg == 1);
 
     int lastTC = -1;
     uint8_t p0 = 0, p1 = 0, p2 = 0, p3 = 0, p4 = 0, p5 = 0, p6 = 0, p7 = 0;
@@ -149,11 +147,22 @@ std::array<PPU::Px, kScreenW> PPU::bgLine(int bg, int y, int bpp) {
 
     for (int x = 0; x < kScreenW; x++) {
         int mx = (mEn && mSize > 1) ? x - (x % mSize) : x;
-        int effX = (mx + bgH[bg]) & ((mapSzX << 3) - 1);
+
+        int hOfs = bgH[bg], vOfs = bgV[bg];
+        if (optMode) {
+            auto opt = optOffset(x >> 3);
+            if (opt[bg].h >= 0) hOfs = (opt[bg].h & ~7) | (bgH[bg] & 7);
+            if (opt[bg].v >= 0) vOfs = opt[bg].v;
+        }
+
+        int effX = (mx + hOfs) & ((mapSzX << 3) - 1);
+        int effY = (mY + vOfs) & ((mapSzY << 3) - 1);
+        int tileRow = effY >> 3;
+        int pxRow   = effY & 7;
         int tc = effX >> 3;
         int pc = effX & 7;
 
-        if (tc != lastTC) {
+        if (tc != lastTC || optMode) {
             lastTC = tc;
             int pgX = (tc >> 5) & 1, pgY = (tileRow >> 5) & 1;
             int page = pgY * pgsW + pgX;
@@ -301,6 +310,42 @@ std::vector<PPU::LayerEntry> PPU::layers(int mode) const {
     return {
         {1,0,3},{0,0,1},{1,0,2},{0,1,1},{1,0,1},{0,0,0},{1,0,0},{0,1,0},
     };
+}
+
+std::array<PPU::OptCol, 2> PPU::optOffset(int tileCol) const {
+    std::array<OptCol, 2> out{};
+    int mode = regs[0x05] & 7;
+    if (mode != 2 && mode != 4 && mode != 6) return out;
+    if (tileCol == 0) return out; // leftmost tile is never affected
+
+    uint8_t bg3SC = regs[0x09];
+    int mapBase = ((bg3SC >> 2) & 0x3F) << 10;
+    int mapSzX  = (bg3SC & 1) ? 64 : 32;
+    int col     = (tileCol - 1) & (mapSzX - 1);
+
+    auto fetchEntry = [&](int row) -> uint16_t {
+        int pgX = (col >> 5) & 1, pgY = (row >> 5) & 1;
+        int page = pgY * (mapSzX == 64 ? 2 : 1) + pgX;
+        int ma = mapBase + page * 0x400 + ((row & 31) << 5) + (col & 31);
+        uint8_t lo = vram[(ma << 1) & 0xFFFF], hi = vram[((ma << 1) + 1) & 0xFFFF];
+        return (hi << 8) | lo;
+    };
+
+    if (mode == 4) {
+        uint16_t e = fetchEntry(0);
+        int val = e & 0x1FFF;
+        bool toBG1 = e & 0x2000, toBG2 = e & 0x4000, isV = e & 0x8000;
+        if (isV) { if (toBG1) out[0].v = val; if (toBG2) out[1].v = val; }
+        else     { if (toBG1) out[0].h = val; if (toBG2) out[1].h = val; }
+    } else {
+        uint16_t eh = fetchEntry(0), ev = fetchEntry(1);
+        int hval = eh & 0x1FFF, vval = ev & 0x1FFF;
+        if (eh & 0x2000) out[0].h = hval;
+        if (eh & 0x4000) out[1].h = hval;
+        if (ev & 0x2000) out[0].v = vval;
+        if (ev & 0x4000) out[1].v = vval;
+    }
+    return out;
 }
 
 std::array<uint8_t, kScreenW> PPU::buildWinMask(int layer) const {

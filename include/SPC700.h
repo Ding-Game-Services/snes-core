@@ -6,6 +6,7 @@
 
 #include <array>
 #include <cstdint>
+#include <vector>
 
 namespace ding::snes {
 
@@ -30,10 +31,12 @@ public:
     std::array<uint16_t, 3> timerDiv{}, timerTarget{}, timerCycles{};
     std::array<uint8_t, 3>  timerOut{};
 
-    std::array<uint8_t, 128> dspRegs{};
+std::array<uint8_t, 128> dspRegs{};
     uint8_t dspAddr = 0;
     uint8_t ctrlReg = 0xB0;
     uint64_t cycles = 0;
+
+    std::vector<uint16_t> pcTrace; // ring buffer of recent PCs, for stall diagnosis
 
 private:
     uint8_t rd(uint16_t addr);
