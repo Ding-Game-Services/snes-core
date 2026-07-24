@@ -161,7 +161,7 @@ const DingSaveStateInfo* ding_get_savestate_info() {
 
 uint32_t ding_get_memory_region_count() {
     if (!g_snes) return 0;
-    uint32_t n = 5; // WRAM, VRAM, CGRAM, OAM, PPU Regs
+    uint32_t n = 6; // WRAM, VRAM, CGRAM, OAM, PPU Regs, SPC RAM
     if (!g_cart->sramBytes().empty()) n++;
     return n;
 }
@@ -206,7 +206,13 @@ void ding_get_memory_region(uint32_t index, DingMemoryRegion* out) {
             out->access = DING_MEM_DIRECT; out->ptr = g_snes->ppu.regs.data();
             out->writable = 0;
             break;
-        case 5:
+case 5:
+            out->name = "SPC RAM"; out->base_addr = 0;
+            out->size = g_snes->spc.ram.size();
+            out->access = DING_MEM_DIRECT; out->ptr = g_snes->spc.ram.data();
+            out->writable = 1;
+            break;
+        case 6:
             if (g_cart && !g_cart->sramBytes().empty()) {
                 out->name = "Cart SRAM"; out->base_addr = 0;
                 out->size = g_cart->sramBytes().size();
@@ -538,8 +544,8 @@ int n = std::snprintf(buf, buf_size,
     size_t start = b.apuLog.size() > 20 ? b.apuLog.size() - 20 : 0;
     for (size_t i = start; i < b.apuLog.size() && used < buf_size; i++) {
         const auto& e = b.apuLog[i];
-        written = std::snprintf(buf + used, buf_size - used, " %c%d=%02X(A=%02X,x%d)",
-            e.dir, e.port, e.val, e.a, e.rep);
+written = std::snprintf(buf + used, buf_size - used, " %c%d=%02X(A=%02X,pc=%06X,x%d)",
+            e.dir, e.port, e.val, e.a, e.pc, e.rep);
         if (written > 0) used += static_cast<size_t>(written);
     }
     return used < buf_size ? used : buf_size - 1;

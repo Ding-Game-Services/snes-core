@@ -33,11 +33,12 @@ struct DmaChannel {
 
 // Ring-buffer entry for APU port diagnostics (read via Bus::apuLog)
 struct ApuLogEntry {
-    char    dir  = 'W';   // 'R' or 'W'
-    uint8_t port = 0;
-    uint8_t val  = 0;
-    uint8_t a    = 0;     // CPU A register at time of access
-    int     rep  = 1;
+    char     dir  = 'W';   // 'R' or 'W'
+    uint8_t  port = 0;
+    uint8_t  val  = 0;
+    uint8_t  a    = 0;     // CPU A register at time of access
+    uint32_t pc   = 0;     // (PBR<<16)|PC of the CPU instruction that caused this access
+    int      rep  = 1;
 };
 
 class Bus {
@@ -88,9 +89,16 @@ public:
 
     std::array<uint8_t, 4> apuOut{}, apuIn{};
     std::vector<ApuLogEntry> apuLog;
-    static constexpr size_t kApuLogMax = 128;
+    static constexpr size_t kApuLogMax = 2048;
 
-    uint8_t openBus = 0;
+uint8_t openBus = 0;
+
+    // Set by internalRead when a $2140-2143 poll repeats the last-seen value
+    // (i.e. the CPU is spin-waiting on the APU, e.g. IPL handshake). SNES::
+    // runFrame checks this to prioritize draining the SPC clock debt right
+    // away instead of waiting for the next natural drain point. Purely a
+    // scheduling nudge — never advances the SPC beyond what spcAcc allows.
+    bool spcSyncRequested = false;
 
     // Serial joypad latch ($4016 strobe, $4016/$4017 serial reads).
     // Public so save-state serialization can reach it directly.

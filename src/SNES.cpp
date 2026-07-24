@@ -90,7 +90,7 @@ void SNES::runFrame() {
     bool ppuDone = false;
     int guard = 0;
 
-    while (!ppuDone && guard++ < 750000) {
+ while (!ppuDone && guard++ < 750000) {
         int cyc = cpu.step();
         int mc = cyc * ((bus.memsel & 1) ? 6 : 8);
 
@@ -103,6 +103,11 @@ void SNES::runFrame() {
             bus.apuOut[3] = spc.outPorts[3];
             spcAcc -= 1.0;
         }
+        // bus.spcSyncRequested is diagnostic-only at this point: the SPC is
+        // already fully caught up to its correct ratio-derived position by
+        // the loop above, every single instruction. No extra action needed —
+        // clearing it here just keeps the flag meaningful for the next read.
+        bus.spcSyncRequested = false;
 
         ppuDone = ppu.advance(mc);
 

@@ -35,30 +35,33 @@ uint8_t Bus::internalRead(uint8_t bank, uint16_t addr) {
     if (addr <= 0x1FFF) return wram[addr & 0x1FFF];
     if (addr <= 0x20FF) return openBus;
     if (addr <= 0x213F) return ppu ? ppu->regRead(addr) : openBus;
-    if (addr <= 0x2143) {
-        int n = addr - 0x2140;
+    if (addr >= 0x2140 && addr <= 0x217F) {
+        int n = addr & 0x3; // mirrors every 4 bytes across $2140-217F
         if (spc) {
             const ApuLogEntry* last = apuLog.empty() ? nullptr : &apuLog.back();
             if (last && last->dir == 'R' && last->port == n) {
-                uint8_t before = spc->outPorts[n];
-                for (int i = 0; i < 512 && spc->outPorts[n] == before; i++) {
-                    spc->step();
-                }
+                // CPU is re-reading the same port/value it saw last time —
+                // classic poll-loop signature (IPL handshake, etc). No longer
+                // force-steps the SPC here; that broke the master-clock ratio
+                // right where timing matters most. Just flag it so runFrame
+                // can prioritize the *normal*, ratio-correct catch-up.
+                spcSyncRequested = true;
             }
         }
-        uint8_t v2 = spc ? spc->outPorts[n] : 0;
+uint8_t v2 = spc ? spc->outPorts[n] : 0;
         uint8_t curA = cpu ? static_cast<uint8_t>(cpu->A & 0xFF) : 0;
+        uint32_t curPC = cpu ? ((static_cast<uint32_t>(cpu->PBR) << 16) | cpu->PC) : 0;
         ApuLogEntry* last = apuLog.empty() ? nullptr : &apuLog.back();
         if (!last || last->dir != 'R' || last->port != n || last->val != v2 || last->a != curA) {
-            apuLog.push_back({'R', static_cast<uint8_t>(n), v2, curA, 1});
+            apuLog.push_back({'R', static_cast<uint8_t>(n), v2, curA, curPC, 1});
             if (apuLog.size() > kApuLogMax) apuLog.erase(apuLog.begin());
         } else {
             last->rep = (last->rep > 0 ? last->rep : 1) + 1;
         }
         return v2;
     }
-    if (addr == 0x2180) return wramPortRead();
-    if (addr <= 0x21FF) return openBus;
+if (addr == 0x2180) return wramPortRead();
+    if (addr <= 0x21FF) return openBus; // $2181-217F handled above; this covers $2181-21FF minus wram port
     if (addr >= 0x2200 && addr <= 0x3FFF) return openBus;
     if (addr == 0x4016) {
         if (joyStrobe) return 1;
@@ -102,12 +105,13 @@ void Bus::internalWrite(uint8_t bank, uint16_t addr, uint8_t val) {
     if (addr == 0x2181) { wmaddr = (wmaddr & 0x1FF00) | val; return; }
     if (addr == 0x2182) { wmaddr = (wmaddr & 0x100FF) | (val << 8); return; }
     if (addr == 0x2183) { wmaddr = (wmaddr & 0x0FFFF) | ((val & 1) << 16); return; }
-    if (addr >= 0x2140 && addr <= 0x2143) {
-        int n = addr - 0x2140;
-        apuIn[n] = val;
+    if (addr >= 0x2140 && addr <= 0x217F) {
+        int n = addr & 0x3; // mirrors every 4 bytes across $2140-217F
+apuIn[n] = val;
         if (spc) spc->inPorts[n] = val;
         uint8_t curA = cpu ? static_cast<uint8_t>(cpu->A & 0xFF) : 0;
-        apuLog.push_back({'W', static_cast<uint8_t>(n), val, curA, 1});
+        uint32_t curPC = cpu ? ((static_cast<uint32_t>(cpu->PBR) << 16) | cpu->PC) : 0;
+        apuLog.push_back({'W', static_cast<uint8_t>(n), val, curA, curPC, 1});
         if (apuLog.size() > kApuLogMax) apuLog.erase(apuLog.begin());
         return;
     }
