@@ -38,7 +38,19 @@ std::array<uint8_t, 128> dspRegs{};
 
     std::vector<uint16_t> pcTrace; // ring buffer of recent PCs, for stall diagnosis
 
+    // ── Audio (diagnostic stub) ────────────────────────────────────────────
+    // No BRR/ADSR voice synthesis yet. This just emits a quiet square-wave
+    // blip whenever any DSP voice is key-on ($4C nonzero), so "silence" vs
+    // "audible activity" tells us whether the SPC driver ever actually ran,
+    // independent of whether real music comes out. Interleaved stereo,
+    // drained by ding_core_snes.cpp via ding_read_audio_samples.
+    std::vector<float> audioBuf;
+    void genAudio(int masterClocks);
+
 private:
+    double audioAcc  = 0.0;
+    double tonePhase = 0.0;
+
     uint8_t rd(uint16_t addr);
     void    wr(uint16_t addr, uint8_t val);
     uint8_t ioRead(uint16_t addr);

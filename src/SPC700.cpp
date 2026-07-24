@@ -75,6 +75,33 @@ uint8_t SPC700::readTimer(int n) {
     return v & 0x0F;
 }
 
+void SPC700::genAudio(int masterClocks) {
+    // 32000 Hz output (matches DingAudioInfo in ding_core_snes.cpp) driven
+    // off the same NTSC master clock everything else uses.
+    static constexpr double kSampleRatio = 32000.0 / 21477272.0;
+    audioAcc += masterClocks * kSampleRatio;
+
+    bool active = dspRegs[0x4C] != 0; // KON register — any voice key-on
+
+    while (audioAcc >= 1.0) {
+        audioAcc -= 1.0;
+        float s = 0.0f;
+        if (active) {
+            tonePhase += 440.0 / 32000.0; // fixed 440Hz blip, not derived from real pitch regs
+            if (tonePhase >= 1.0) tonePhase -= 1.0;
+            s = (tonePhase < 0.5) ? 0.15f : -0.15f; // quiet — this is a diagnostic, not music
+        }
+        audioBuf.push_back(s); // L
+        audioBuf.push_back(s); // R
+    }
+
+    // Cap growth in case the frontend falls behind on draining (~1s of audio).
+    constexpr size_t kMaxBuffered = 32000 * 2;
+    if (audioBuf.size() > kMaxBuffered) {
+        audioBuf.erase(audioBuf.begin(), audioBuf.begin() + (audioBuf.size() - kMaxBuffered));
+    }
+}
+
 namespace {
 
 // Free functions kept file-local — step() below uses these plus a handful

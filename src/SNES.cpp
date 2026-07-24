@@ -94,7 +94,7 @@ void SNES::runFrame() {
         int cyc = cpu.step();
         int mc = cyc * ((bus.memsel & 1) ? 6 : 8);
 
-        spcAcc += mc * 0.04768;
+ spcAcc += mc * 0.04768;
         while (spcAcc >= 1.0) {
             spc.step();
             bus.apuOut[0] = spc.outPorts[0];
@@ -103,7 +103,8 @@ void SNES::runFrame() {
             bus.apuOut[3] = spc.outPorts[3];
             spcAcc -= 1.0;
         }
-        // bus.spcSyncRequested is diagnostic-only at this point: the SPC is
+        spc.genAudio(mc); // sample clock runs off real elapsed master cycles, same as spcAcc
+        // bus.spcSyncRequested is diagnostic-only at this point:
         // already fully caught up to its correct ratio-derived position by
         // the loop above, every single instruction. No extra action needed —
         // clearing it here just keeps the flag meaningful for the next read.

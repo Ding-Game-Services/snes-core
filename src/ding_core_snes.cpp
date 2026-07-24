@@ -253,12 +253,26 @@ void ding_get_current_dimensions(uint32_t* width, uint32_t* height) {
     if (height) *height = kScreenH;
 }
 
-// ── Audio output (stub — no DSP yet, see file header) ─────────────────────
-uint32_t ding_get_audio_sample_count() { return 0; }
+// ── Audio output ────────────────────────────────────────────────────────
+// Real DSP/mixer isn't implemented yet — see file header. This drains the
+// KON-triggered tone stub from SPC700::genAudio, which is enough to tell
+// "driver never started" from "driver running" while chasing boot bugs.
+uint32_t ding_get_audio_sample_count() {
+    if (!g_snes) return 0;
+    return static_cast<uint32_t>(g_snes->spc.audioBuf.size() / 2); // stereo frames
+}
 
 uint32_t ding_read_audio_samples(float* buf, uint32_t count) {
-    if (buf && count) std::memset(buf, 0, sizeof(float) * count * 2); // silence, stereo
-    return 0;
+    if (!g_snes || !buf || !count) return 0;
+    auto& ab = g_snes->spc.audioBuf;
+    uint32_t available = static_cast<uint32_t>(ab.size() / 2);
+    uint32_t toCopy = std::min(count, available);
+    if (toCopy) {
+        std::memcpy(buf, ab.data(), static_cast<size_t>(toCopy) * 2 * sizeof(float));
+        ab.erase(ab.begin(), ab.begin() + static_cast<ptrdiff_t>(toCopy) * 2);
+    }
+    if (toCopy < count) std::memset(buf + toCopy * 2, 0, sizeof(float) * (count - toCopy) * 2);
+    return toCopy;
 }
 
 // ── Input ────────────────────────────────────────────────────────────────
