@@ -142,10 +142,10 @@ uint8_t Bus::internalRegRead(uint16_t addr) {
         case 0x4210: { uint8_t v = nmiFlag | 0x02; nmiFlag = 0; return v; }
         case 0x4211: { uint8_t v = irqFlag; irqFlag = 0; return v; }
         case 0x4212: {
-            uint8_t vbl = (ppu && ppu->vblank) ? 0x80 : 0;
-            uint8_t hbl = (ppu && ppu->hblank) ? 0x40 : 0;
-            return vbl | hbl | 0x01;
-        }
+    uint8_t vbl = (ppu && ppu->vblank) ? 0x80 : 0;
+    uint8_t hbl = (ppu && ppu->hblank) ? 0x40 : 0;
+    return vbl | hbl;
+}
         case 0x4213: return wrio;
         case 0x4214: return divResult & 0xFF;
         case 0x4215: return (divResult >> 8) & 0xFF;
@@ -253,7 +253,7 @@ void Bus::runDMA() {
         int patLen = PATTERN_LEN[c.ctrl & 0x7];
         bool toWRAM = c.ctrl & 0x80;
         bool fixed  = c.ctrl & 0x08;
-        bool decr   = c.ctrl & 0x10;
+		bool decr   = c.ctrl & 0x10;
 
         uint32_t src = (c.srcBank << 16) | c.srcAddr;
         uint32_t count = c.size == 0 ? 0x10000 : c.size;

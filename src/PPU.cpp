@@ -72,14 +72,14 @@ void PPU::regWrite(uint16_t addr, uint8_t val) {
             }
             oamByteAddr = (oamByteAddr + 1) & 0x3FF;
             break;
-        case 0x0D: bgH[0] = ((val << 8) | m7prev) & 0x3FF; m7prev = val; break;
-        case 0x0E: bgV[0] = ((val << 8) | m7prev) & 0x3FF; m7prev = val; break;
-        case 0x0F: bgH[1] = ((val << 8) | bgPrev) & 0x3FF; bgPrev = val; break;
-        case 0x10: bgV[1] = ((val << 8) | bgPrev) & 0x3FF; bgPrev = val; break;
-        case 0x11: bgH[2] = ((val << 8) | bgPrev) & 0x3FF; bgPrev = val; break;
-        case 0x12: bgV[2] = ((val << 8) | bgPrev) & 0x3FF; bgPrev = val; break;
-        case 0x13: bgH[3] = ((val << 8) | bgPrev) & 0x3FF; bgPrev = val; break;
-        case 0x14: bgV[3] = ((val << 8) | bgPrev) & 0x3FF; bgPrev = val; break;
+        case 0x0D: bgH[0] = ((val << 8) | (m7prev & 0xF8) | ((bgH[0] >> 8) & 0x07)) & 0x3FF; m7prev = val; break;
+case 0x0E: bgV[0] = ((val << 8) | m7prev) & 0x3FF; m7prev = val; break;
+case 0x0F: bgH[1] = ((val << 8) | (bgPrev & 0xF8) | ((bgH[1] >> 8) & 0x07)) & 0x3FF; bgPrev = val; break;
+case 0x10: bgV[1] = ((val << 8) | bgPrev) & 0x3FF; bgPrev = val; break;
+case 0x11: bgH[2] = ((val << 8) | (bgPrev & 0xF8) | ((bgH[2] >> 8) & 0x07)) & 0x3FF; bgPrev = val; break;
+case 0x12: bgV[2] = ((val << 8) | bgPrev) & 0x3FF; bgPrev = val; break;
+case 0x13: bgH[3] = ((val << 8) | (bgPrev & 0xF8) | ((bgH[3] >> 8) & 0x07)) & 0x3FF; bgPrev = val; break;
+case 0x14: bgV[3] = ((val << 8) | bgPrev) & 0x3FF; bgPrev = val; break;
         case 0x15: {
             static constexpr uint8_t incs[4] = {1, 32, 128, 128};
             vramInc = incs[val & 3];

@@ -528,8 +528,11 @@ size_t ding_diag_video_state(char* buf, size_t buf_size) {
     if (!buf || buf_size == 0 || !g_snes) return 0;
     const PPU& p = g_snes->ppu;
     int n = std::snprintf(buf, buf_size,
-        "scanline=%d frame=%u vblank=%d mode=%d tm=%02X ts=%02X inidisp=%02X",
-        p.scanline, p.frame, p.vblank ? 1 : 0, p.regs[0x05] & 7, p.regs[0x2C], p.regs[0x2D], p.regs[0x00]);
+        "scanline=%d frame=%u vblank=%d mode=%d tm=%02X ts=%02X inidisp=%02X | "
+        "scrollH=%d,%d,%d,%d scrollV=%d,%d,%d,%d",
+        p.scanline, p.frame, p.vblank ? 1 : 0, p.regs[0x05] & 7, p.regs[0x2C], p.regs[0x2D], p.regs[0x00],
+        p.bgH[0], p.bgH[1], p.bgH[2], p.bgH[3],
+        p.bgV[0], p.bgV[1], p.bgV[2], p.bgV[3]);
     return n < 0 ? 0 : static_cast<size_t>(n);
 }
 
@@ -562,6 +565,60 @@ written = std::snprintf(buf + used, buf_size - used, " %c%d=%02X(A=%02X,pc=%06X,
             e.dir, e.port, e.val, e.a, e.pc, e.rep);
         if (written > 0) used += static_cast<size_t>(written);
     }
+    return used < buf_size ? used : buf_size - 1;
+}
+
+size_t ding_diag_handshake_state(char* buf, size_t buf_size) {
+    if (!buf || buf_size == 0 || !g_snes) return 0;
+    const Bus& b = g_snes->bus;
+    const SPC700& s = g_snes->spc;
+    const CPU65816& c = g_snes->cpu;
+
+    // First occurrence of each handshake milestone still present in the
+    // apuLog ring buffer (it may have scrolled off if this happened long ago).
+    const ApuLogEntry* wCC = nullptr; // CPU wrote $CC to port0 ("go" signal)
+    const ApuLogEntry* rAA = nullptr; // CPU read $AA back from port0
+    const ApuLogEntry* rBB = nullptr; // CPU read $BB back from port1
+    for (const auto& e : b.apuLog) {
+        if (!wCC && e.dir == 'W' && e.port == 0 && e.val == 0xCC) wCC = &e;
+        if (!rAA && e.dir == 'R' && e.port == 0 && e.val == 0xAA) rAA = &e;
+        if (!rBB && e.dir == 'R' && e.port == 1 && e.val == 0xBB) rBB = &e;
+    }
+
+    // Cheap "is the SPC stuck oscillating between two addresses" check —
+    // catches the $FFCF/$FFD2 CMP/BNE wait loop (or any other 2-op spin).
+    bool spcLoop2 = false;
+    if (s.pcTrace.size() >= 4) {
+        size_t n = s.pcTrace.size();
+        uint16_t p0 = s.pcTrace[n-1], p1 = s.pcTrace[n-2];
+        spcLoop2 = true;
+        for (size_t i = n - 4; i < n; i++) {
+            if (s.pcTrace[i] != p0 && s.pcTrace[i] != p1) { spcLoop2 = false; break; }
+        }
+    }
+
+    size_t used = 0;
+    int n;
+    n = std::snprintf(buf + used, buf_size - used, "spcPC=%04X %s | ",
+                       s.PC, spcLoop2 ? "SPINNING(2-loop)" : "moving");
+    if (n > 0) used += static_cast<size_t>(n);
+
+    if (wCC) n = std::snprintf(buf + used, buf_size - used, "CPU wrote $CC->port0 @cpuPC=%06X | ", wCC->pc);
+    else     n = std::snprintf(buf + used, buf_size - used, "CPU has NOT written $CC to port0 yet | ");
+    if (n > 0) used += static_cast<size_t>(n);
+
+    if (rAA) n = std::snprintf(buf + used, buf_size - used, "CPU saw $AA<-port0 @cpuPC=%06X | ", rAA->pc);
+    else     n = std::snprintf(buf + used, buf_size - used, "CPU has NOT seen $AA on port0 yet | ");
+    if (n > 0) used += static_cast<size_t>(n);
+
+    if (rBB) n = std::snprintf(buf + used, buf_size - used, "CPU saw $BB<-port1 @cpuPC=%06X | ", rBB->pc);
+    else     n = std::snprintf(buf + used, buf_size - used, "CPU has NOT seen $BB on port1 yet | ");
+    if (n > 0) used += static_cast<size_t>(n);
+
+    n = std::snprintf(buf + used, buf_size - used, "cpuCyc=%llu spcCyc=%llu",
+                       static_cast<unsigned long long>(c.cycles), static_cast<unsigned long long>(s.cycles));
+    if (n > 0) used += static_cast<size_t>(n);
+
     return used < buf_size ? used : buf_size - 1;
 }
 

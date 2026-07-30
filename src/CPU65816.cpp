@@ -539,7 +539,7 @@ int CPU65816::step() {
         case 0x00: {
             f8();
             if (!E) ph8(PBR);
-            ph16(PC); ph8(E ? (P | 0x30) : (P | 0x10));
+            ph16(PC); ph8(E ? (P | 0x30) : P);
             sI(true); sD(false); PBR = 0;
             PC = r16(0, E ? 0xFFFE : 0xFFE6);
             cy = 8; break;
