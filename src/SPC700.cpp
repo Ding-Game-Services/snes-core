@@ -210,6 +210,54 @@ int SPC700::step() {
         case 0xFA: { uint16_t src = dp(), dst = dp(); wr(dst, rd(src)); cy = 5; break; }
         case 0xBA: { uint16_t a = dp(); A = rd(a); Y = rd((a + 1) & 0xFFFF); sNZ16((Y << 8) | A); cy = 5; break; }
         case 0xDA: { uint16_t a = dp(); wr(a, A); wr((a + 1) & 0xFFFF, Y); cy = 5; break; }
+		case 0xBA: { uint16_t a = dp(); A = rd(a); Y = rd((a + 1) & 0xFFFF); sNZ16((Y << 8) | A); cy = 5; break; }
+        case 0xDA: { uint16_t a = dp(); wr(a, A); wr((a + 1) & 0xFFFF, Y); cy = 5; break; }
+        case 0x1A: {
+            uint16_t a = dp();
+            uint16_t v = (static_cast<uint16_t>(rd((a+1)&0xFFFF)) << 8 | rd(a));
+            v = (v - 1) & 0xFFFF;
+            wr(a, v & 0xFF); wr((a+1)&0xFFFF, (v >> 8) & 0xFF);
+            sNZ16(v); cy = 6; break;
+        }
+        case 0x3A: {
+            uint16_t a = dp();
+            uint16_t v = (static_cast<uint16_t>(rd((a+1)&0xFFFF)) << 8 | rd(a));
+            v = (v + 1) & 0xFFFF;
+            wr(a, v & 0xFF); wr((a+1)&0xFFFF, (v >> 8) & 0xFF);
+            sNZ16(v); cy = 6; break;
+        }
+        case 0x5A: {
+            uint16_t a = dp();
+            uint16_t v = (static_cast<uint16_t>(rd((a+1)&0xFFFF)) << 8 | rd(a));
+            uint16_t ya = (static_cast<uint16_t>(Y) << 8) | A;
+            int r = ya - v;
+            N = (r & 0x8000) != 0; Z = ((r & 0xFFFF) == 0); C = (r >= 0);
+            cy = 4; break;
+        }
+        case 0x7A: {
+            uint16_t a = dp();
+            uint16_t v = (static_cast<uint16_t>(rd((a+1)&0xFFFF)) << 8 | rd(a));
+            uint16_t ya = (static_cast<uint16_t>(Y) << 8) | A;
+            int r = ya + v;
+            H = (((ya & 0xFFF) + (v & 0xFFF)) & 0x1000) != 0;
+            V = (~(ya ^ v) & (ya ^ r) & 0x8000) != 0;
+            C = r > 0xFFFF;
+            uint16_t res = static_cast<uint16_t>(r & 0xFFFF);
+            A = res & 0xFF; Y = (res >> 8) & 0xFF;
+            sNZ16(res); cy = 5; break;
+        }
+        case 0x9A: {
+            uint16_t a = dp();
+            uint16_t v = (static_cast<uint16_t>(rd((a+1)&0xFFFF)) << 8 | rd(a));
+            uint16_t ya = (static_cast<uint16_t>(Y) << 8) | A;
+            int r = ya - v;
+            H = (((ya & 0xFFF) - (v & 0xFFF)) & 0x1000) != 0;
+            V = ((ya ^ v) & (ya ^ r) & 0x8000) != 0;
+            C = r >= 0;
+            uint16_t res = static_cast<uint16_t>(r & 0xFFFF);
+            A = res & 0xFF; Y = (res >> 8) & 0xFF;
+            sNZ16(res); cy = 5; break;
+        }
         case 0x88: A = adcOp(A, rd(PC++)); cy = 2; break;
         case 0x84: A = adcOp(A, rd(dp()));   cy = 3; break;
         case 0x94: A = adcOp(A, rd(dpx()));  cy = 4; break;
@@ -419,6 +467,14 @@ case 0x4E: { uint16_t a = abs_(); uint8_t v = rd(a); sNZ(A & v); wr(a, v & ~A); 
         case 0xA0: I = 1; cy = 2; break;
         case 0xC0: I = 0; cy = 2; break;
         case 0x00: cy = 2; break;
+		case 0x0F: {
+            push((PC >> 8) & 0xFF); push(PC & 0xFF); push(getP());
+            I = 0; B = 1;
+            PC = (rd(0xFFDF) << 8) | rd(0xFFDE);
+            cy = 8; break;
+        }
+        case 0xFF: cy = 2; break;
+        case 0xEF: cy = 2; break;
         case 0xFF: cy = 2; break;
         case 0xEF: cy = 2; break;
         default:   cy = 2; break;

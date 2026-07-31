@@ -181,7 +181,7 @@ void CPU65816::sbc(uint32_t val) {
 }
 
 void CPU65816::reset() {
-    E = true; P = 0x34; SP = 0x01FF; DP = DBR = PBR = 0;
+    E = true; P = 0x34; SP = 0x01FC; DP = DBR = PBR = 0;
     stopped = false; waiting = false; cycles = 0;
     PC = r16(0, 0xFFFC);
     pcTrace.clear(); _lastTracedPC = -1;
@@ -571,6 +571,12 @@ int CPU65816::step() {
         case 0xB8: sV(false); break;
         case 0xC2: { uint8_t m = f8(); P &= ~m; if (E) P |= 0x30; if (fX()) { X &= 0xFF; Y &= 0xFF; } cy = 3; break; }
         case 0xE2: { uint8_t m = f8(); P |= m; if (fX()) { X &= 0xFF; Y &= 0xFF; } cy = 3; break; }
+case 0xEB: {
+            uint8_t hi = (A >> 8) & 0xFF, lo = A & 0xFF;
+            A = static_cast<uint16_t>((lo << 8) | hi);
+            sN((A & 0x80) != 0); sZ((A & 0xFF) == 0); // NZ from new low byte, always 8-bit test
+            cy = 3; break;
+        }
         case 0xFB: {
             bool oe = E, oc = fC();
             E = oc; sC(oe);
