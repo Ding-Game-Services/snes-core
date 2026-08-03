@@ -288,10 +288,10 @@ int CPU65816::step() {
         case 0x9A: SP = E ? (0x100 | (X & 0xFF)) : (X & 0xFFFF); break;
         case 0x9B: Y = X; nzX(Y); break;
         case 0xBB: X = Y; nzX(X); break;
-        case 0x5B: DP = A & 0xFFFF; nzX(DP); break;
-        case 0x7B: A = DP; nzX(A); break;
+        case 0x5B: DP = A & 0xFFFF; nz16(DP); break;
+        case 0x7B: A = DP; nz16(A); break;
         case 0x1B: SP = E ? (0x100 | (A & 0xFF)) : (A & 0xFFFF); break;
-        case 0x3B: A = SP; nzX(A); break;
+        case 0x3B: A = SP; nz16(A); break;
         case 0x48: fM() ? ph8(A & 0xFF) : ph16(A); cy = 3; break;
         case 0xDA: fX() ? ph8(X & 0xFF) : ph16(X); cy = 3; break;
         case 0x5A: fX() ? ph8(Y & 0xFF) : ph16(Y); cy = 3; break;
@@ -306,8 +306,8 @@ int CPU65816::step() {
         case 0xFA: { X = fX() ? pl8() : pl16(); nzX(X); cy = 4; break; }
         case 0x7A: { Y = fX() ? pl8() : pl16(); nzX(Y); cy = 4; break; }
         case 0x28: { P = pl8(); if (E) P |= 0x30; if (fX()) { X &= 0xFF; Y &= 0xFF; } cy = 4; break; }
-        case 0xAB: { DBR = pl8(); nzX(DBR); cy = 4; break; }
-        case 0x2B: { DP = pl16(); nzX(DP); cy = 5; break; }
+        case 0xAB: { DBR = pl8(); nz8(DBR); cy = 4; break; }
+        case 0x2B: { DP = pl16(); nz16(DP); cy = 5; break; }
         case 0x69: adc(rdM(amImmM())); cy = fM() ? 2 : 3; break;
         case 0x65: adc(rdM(amDP()));   cy = 3; break;
         case 0x75: adc(rdM(amDPX()));  cy = 4; break;

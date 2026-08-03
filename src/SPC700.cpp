@@ -210,8 +210,6 @@ int SPC700::step() {
         case 0xFA: { uint16_t src = dp(), dst = dp(); wr(dst, rd(src)); cy = 5; break; }
         case 0xBA: { uint16_t a = dp(); A = rd(a); Y = rd((a + 1) & 0xFFFF); sNZ16((Y << 8) | A); cy = 5; break; }
         case 0xDA: { uint16_t a = dp(); wr(a, A); wr((a + 1) & 0xFFFF, Y); cy = 5; break; }
-		case 0xBA: { uint16_t a = dp(); A = rd(a); Y = rd((a + 1) & 0xFFFF); sNZ16((Y << 8) | A); cy = 5; break; }
-        case 0xDA: { uint16_t a = dp(); wr(a, A); wr((a + 1) & 0xFFFF, Y); cy = 5; break; }
         case 0x1A: {
             uint16_t a = dp();
             uint16_t v = (static_cast<uint16_t>(rd((a+1)&0xFFFF)) << 8 | rd(a));
@@ -427,7 +425,7 @@ int SPC700::step() {
             PC = 0xFF00 | pg; cy = 6; break;
         }
         case 0x6F: { uint8_t lo = pop(), hi = pop(); PC = (hi << 8) | lo; cy = 5; break; }
-        case 0x7F: { uint8_t lo = pop(), hi = pop(); PC = (hi << 8) | lo; setP(pop()); cy = 6; break; }
+        case 0x7F: { uint8_t p = pop(); uint8_t lo = pop(), hi = pop(); setP(p); PC = (hi << 8) | lo; cy = 6; break; }
         case 0x01: case 0x11: case 0x21: case 0x31: case 0x41: case 0x51: case 0x61: case 0x71:
         case 0x81: case 0x91: case 0xA1: case 0xB1: case 0xC1: case 0xD1: case 0xE1: case 0xF1: {
             int n = op >> 4; uint16_t vec = static_cast<uint16_t>(0xFFDE - (n * 2));
@@ -473,8 +471,6 @@ case 0x4E: { uint16_t a = abs_(); uint8_t v = rd(a); sNZ(A & v); wr(a, v & ~A); 
             PC = (rd(0xFFDF) << 8) | rd(0xFFDE);
             cy = 8; break;
         }
-        case 0xFF: cy = 2; break;
-        case 0xEF: cy = 2; break;
         case 0xFF: cy = 2; break;
         case 0xEF: cy = 2; break;
         default:   cy = 2; break;

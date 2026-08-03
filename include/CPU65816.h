@@ -60,8 +60,10 @@ public:
     void sZ(bool v) { v ? P |= 0x02 : P &= ~0x02; }
     void sC(bool v) { v ? P |= 0x01 : P &= ~0x01; }
 
-    void nzM(uint32_t v);
+void nzM(uint32_t v);
     void nzX(uint32_t v);
+    void nz16(uint32_t v) { sN((v & 0x8000) != 0); sZ((v & 0xFFFF) == 0); }
+    void nz8(uint32_t v)  { sN((v & 0x80) != 0);   sZ((v & 0xFF) == 0); }
 
 private:
     // ── Memory access ─────────────────────────────────────────────────────
