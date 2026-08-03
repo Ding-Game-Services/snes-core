@@ -77,7 +77,7 @@ private:
     struct Px { uint8_t cgi = 0; uint8_t prio = 0; bool valid = false; };
 
     std::array<Px, kScreenW> bgLine(int bg, int y, int bpp);
-    std::array<Px, kScreenW> m7Line(int y);
+    std::array<Px, kScreenW> m7Line(int y, std::array<Px, kScreenW>* bg2Out = nullptr);
     std::array<Px, kScreenW> sprLine(int y);
 
     // layers(): each entry is {isSprite(0/1), bgIndex, priority}

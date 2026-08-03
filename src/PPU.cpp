@@ -47,7 +47,14 @@ uint8_t PPU::regRead(uint16_t addr) {
             return v;
         }
         case 0x3E: return 0x01;
-        case 0x3F: return (vblank ? 0x80 : 0) | 0x02;
+        case 0x3F: {
+            // STAT78: bit7=interlace field (unused, always 0 - no interlace),
+            // bit5=PAL/NTSC (0=NTSC, hardcoded until region switching exists),
+            // bit4=ppu1/2 version marker, bits3-0=CPU version.
+            // Real hardware also resets the Mode 7 h/v-counter latch on this
+            // read; we don't latch counters yet so nothing to clear here.
+            return 0x02;
+        }
         default:
             return (r >= 0 && r < static_cast<int>(regs.size())) ? regs[r] : 0;
     }
@@ -202,8 +209,14 @@ uint8_t nba     = regs[0x0B + (bg >> 1)];
     return out;
 }
 
-std::array<PPU::Px, kScreenW> PPU::m7Line(int y) {
+std::array<PPU::Px, kScreenW> PPU::m7Line(int y, std::array<Px, kScreenW>* bg2Out) {
     std::array<Px, kScreenW> out{};
+    if (bg2Out) bg2Out->fill(Px{});
+    // EXTBG (SETINI $2133 bit6): tile byte's bit7 splits the plane into two
+    // logical layers instead of one 8bpp one — bit7=0 -> BG1 (7bpp, colors
+    // 0-127), bit7=1 -> BG2 (also 7bpp). BG2 priority is fixed at 0 on
+    // real hardware; we mirror that by always tagging bg2Out prio=0.
+    bool extbg = (regs[0x33] & 0x40) != 0;
     uint8_t sel = regs[0x1A];
     int32_t sx = (static_cast<int32_t>(bgH[0]) << 19) >> 19;
     int32_t sy = (static_cast<int32_t>(bgV[0]) << 19) >> 19;
@@ -215,23 +228,34 @@ std::array<PPU::Px, kScreenW> PPU::m7Line(int y) {
     int32_t d  = (static_cast<int32_t>(m7d) << 16) >> 16;
     int32_t ry = y + sy - cy;
 
-    for (int x = 0; x < kScreenW; x++) {
+ for (int x = 0; x < kScreenW; x++) {
         int32_t rx = x + sx - cx;
         int32_t tx = ((a * rx + b * ry) >> 8) + cx;
         int32_t ty = ((c * rx + d * ry) >> 8) + cy;
-        if (tx < 0 || tx > 1023 || ty < 0 || ty > 1023) {
+        bool outOfRange = (tx < 0 || tx > 1023 || ty < 0 || ty > 1023);
+        bool forceTile0 = false;
+        if (outOfRange) {
             if (sel & 0x80) {
-                if (sel & 0x40) continue; // out[x] stays invalid
-                out[x] = { 0, 0, true };
-                continue;
+                if (!(sel & 0x40)) continue; // bits 10: transparent, out[x] stays invalid
+                forceTile0 = true;           // bits 11: fill with character 0's bitmap
+            } else {
+                tx &= 1023; ty &= 1023;       // bits 00/01: wrap
             }
-            tx &= 1023; ty &= 1023;
         }
         int mapAddr = ((ty >> 3) & 0x7F) * 128 + ((tx >> 3) & 0x7F);
-        uint8_t tileNo = vram[(mapAddr << 1) & 0xFFFF];
+        uint8_t tileNo = forceTile0 ? 0 : vram[(mapAddr << 1) & 0xFFFF];
         int charAddr = (tileNo * 64 + ((ty & 7) << 3) + (tx & 7)) & 0x7FFF;
         uint8_t ci = vram[((charAddr << 1) + 1) & 0xFFFF];
-        if (ci != 0) out[x] = { ci, 0, true };
+        if (extbg) {
+            uint8_t color = ci & 0x7F;
+            if (ci & 0x80) {
+                if (bg2Out && color != 0) (*bg2Out)[x] = { color, 0, true };
+            } else if (color != 0) {
+                out[x] = { color, 0, true };
+            }
+        } else if (ci != 0) {
+            out[x] = { ci, 0, true };
+        }
     }
     return out;
 }
@@ -439,7 +463,15 @@ void PPU::renderScanline(int y) {
     bool haveSpr = false;
 
     if (mode == 7) {
-        if (tm & 1) { bgL[0] = m7Line(y); haveBg[0] = true; }
+        bool extbg = (regs[0x33] & 0x40) != 0;
+        bool need0 = ((tm | ts) & 0x01) != 0;
+        bool need1 = extbg && ((tm | ts) & 0x02) != 0;
+        if (need0 || need1) {
+            std::array<Px, kScreenW> bg2{};
+            std::array<Px, kScreenW> bg1 = m7Line(y, need1 ? &bg2 : nullptr);
+            if (need0) { bgL[0] = bg1; haveBg[0] = true; }
+            if (need1) { bgL[1] = bg2; haveBg[1] = true; }
+        }
     } else {
         for (int bg = 0; bg < 4; bg++) {
             int bpp = bppT[mode][bg];
@@ -450,6 +482,21 @@ void PPU::renderScanline(int y) {
 
     auto layerList = layers(mode);
     uint16_t subBD = (cgwsel & 0x02) ? fixedColor : cgram[0];
+
+    // Direct Color mode (CGWSEL bit0): bypasses CGRAM for 8bpp BG1 in modes
+    // 3/4 and for Mode 7 BG1/EXTBG-BG2 — those layers never use a CGRAM
+    // sub-palette on real hardware, so `cgi` there is already the raw
+    // 3/3/2-bit-packed index; just spread it into a 5/5/5 color directly.
+    bool directColorEn = (cgwsel & 0x01) != 0;
+    auto directColor = [](uint8_t idx) -> uint16_t {
+        int r = (idx & 0x07) << 2;
+        int g = (idx & 0x38) >> 1;
+        int b = (idx & 0xC0) >> 3;
+        return static_cast<uint16_t>(r | (g << 5) | (b << 10));
+    };
+    auto isDirectLayer = [&](int layerIdx) {
+        return directColorEn && layerIdx == 0 && (mode == 3 || mode == 4 || mode == 7);
+    };
 
     for (int x = 0; x < kScreenW; x++) {
         int mainCGI = 0, mainLayer = -1;
@@ -473,7 +520,7 @@ void PPU::renderScanline(int y) {
             }
         }
 
-        uint16_t subC15 = subBD;
+uint16_t subC15 = subBD;
         if (cmEn) {
             for (auto& layer : layerList) {
                 int tsBit = layer.isSprite == 1 ? 0x10 : (1 << layer.idx);
@@ -491,12 +538,16 @@ void PPU::renderScanline(int y) {
                     int bg = layer.idx;
                     if (!haveBg[bg]) continue;
                     const Px& px = bgL[bg][x];
-                    if (px.valid && px.prio == layer.prio) { subC15 = cgram[px.cgi]; break; }
+                    if (px.valid && px.prio == layer.prio) {
+                        subC15 = isDirectLayer(bg) ? directColor(px.cgi) : cgram[px.cgi];
+                        break;
+                    }
                 }
             }
         }
 
-        uint16_t c15 = cgram[mainCGI];
+        uint16_t c15 = isDirectLayer(mainLayer) ? directColor(static_cast<uint8_t>(mainCGI)) : cgram[mainCGI];
+
         bool doCM = false;
         if (cmForce != 3 && cmEn) {
             int lbit = mainLayer == -1 ? 0x20 : mainLayer == 4 ? 0x10 : (1 << mainLayer);
