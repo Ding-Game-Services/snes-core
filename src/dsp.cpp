@@ -1,5 +1,5 @@
 // ── DSP.cpp ──────────────────────────────────────────────────────────────────
-#include "DSP.h"
+#include "dsp.h"
 
 #include <algorithm>
 #include <cmath>

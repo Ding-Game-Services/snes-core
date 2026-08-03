@@ -74,7 +74,10 @@ private:
 
     // One rendered background/sprite pixel: cgi = CGRAM color index, prio = priority bit.
     // `valid` mirrors the JS `out[x] === null` (no opaque pixel at this x).
-    struct Px { uint8_t cgi = 0; uint8_t prio = 0; bool valid = false; };
+    // attr: for Direct Color layers, the tilemap's 3-bit palette-selection
+    // field is repurposed as extra r/g/b bits (bit0=r, bit1=g, bit2=b) — see
+    // Tiles wiki "8bpp Direct Color". Unused/zero for non-direct-color pixels.
+    struct Px { uint8_t cgi = 0; uint8_t prio = 0; bool valid = false; uint8_t attr = 0; };
 
     std::array<Px, kScreenW> bgLine(int bg, int y, int bpp);
     std::array<Px, kScreenW> m7Line(int y, std::array<Px, kScreenW>* bg2Out = nullptr);

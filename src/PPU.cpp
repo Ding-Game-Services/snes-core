@@ -204,7 +204,7 @@ uint8_t nba     = regs[0x0B + (bg >> 1)];
         if (mode == 0) cgi = bg * 32 + palette * 4 + ci;
         else if (bpp == 8) cgi = ci;
         else cgi = palette * (1 << bpp) + ci;
-        out[x] = { static_cast<uint8_t>(cgi & 0xFF), static_cast<uint8_t>(prio), true };
+out[x] = { static_cast<uint8_t>(cgi & 0xFF), static_cast<uint8_t>(prio), true, static_cast<uint8_t>(palette & 7) };
     }
     return out;
 }
@@ -212,10 +212,12 @@ uint8_t nba     = regs[0x0B + (bg >> 1)];
 std::array<PPU::Px, kScreenW> PPU::m7Line(int y, std::array<Px, kScreenW>* bg2Out) {
     std::array<Px, kScreenW> out{};
     if (bg2Out) bg2Out->fill(Px{});
-    // EXTBG (SETINI $2133 bit6): tile byte's bit7 splits the plane into two
-    // logical layers instead of one 8bpp one — bit7=0 -> BG1 (7bpp, colors
-    // 0-127), bit7=1 -> BG2 (also 7bpp). BG2 priority is fixed at 0 on
-    // real hardware; we mirror that by always tagging bg2Out prio=0.
+    // EXTBG (SETINI $2133 bit6): BG1 always renders the low 7 bits of the
+    // tile pixel, regardless of bit7. When EXTBG is on, BG2 renders that
+    // SAME low-7-bit color simultaneously (not exclusively) — bit7 is
+    // purely BG2's priority bit (0=below, 1=above other layers per the
+    // mode 7 priority table), not a BG1-vs-BG2 selector. BG1 typically
+    // ends up obscuring low-priority BG2 pixels since it sits above them.
     bool extbg = (regs[0x33] & 0x40) != 0;
     uint8_t sel = regs[0x1A];
     int32_t sx = (static_cast<int32_t>(bgH[0]) << 19) >> 19;
@@ -246,12 +248,11 @@ std::array<PPU::Px, kScreenW> PPU::m7Line(int y, std::array<Px, kScreenW>* bg2Ou
         uint8_t tileNo = forceTile0 ? 0 : vram[(mapAddr << 1) & 0xFFFF];
         int charAddr = (tileNo * 64 + ((ty & 7) << 3) + (tx & 7)) & 0x7FFF;
         uint8_t ci = vram[((charAddr << 1) + 1) & 0xFFFF];
-        if (extbg) {
+if (extbg) {
             uint8_t color = ci & 0x7F;
-            if (ci & 0x80) {
-                if (bg2Out && color != 0) (*bg2Out)[x] = { color, 0, true };
-            } else if (color != 0) {
+            if (color != 0) {
                 out[x] = { color, 0, true };
+                if (bg2Out) (*bg2Out)[x] = { color, static_cast<uint8_t>((ci >> 7) & 1), true };
             }
         } else if (ci != 0) {
             out[x] = { ci, 0, true };
@@ -262,16 +263,28 @@ std::array<PPU::Px, kScreenW> PPU::m7Line(int y, std::array<Px, kScreenW>* bg2Ou
 
 std::array<PPU::Px, kScreenW> PPU::sprLine(int y) {
     std::array<Px, kScreenW> out{};
-uint8_t obsel = regs[0x01];
-static constexpr int SZ[8][4] = {
-    {8,8,16,16}, {8,8,32,32}, {8,8,64,64}, {16,16,32,32},
-    {16,16,64,64}, {32,32,64,64}, {16,32,32,64}, {16,32,32,64},
-};
-const int* sz = SZ[obsel & 7];
-int nb0 = ((obsel >> 5) & 7) << 13;
-int nb1 = nb0 + ((((obsel >> 3) & 3) + 1) << 12);
-    int count = 0;
+    uint8_t obsel = regs[0x01];
+    static constexpr int SZ[8][4] = {
+        {8,8,16,16}, {8,8,32,32}, {8,8,64,64}, {16,16,32,32},
+        {16,16,64,64}, {32,32,64,64}, {16,32,32,64}, {16,32,32,64},
+    };
+    const int* sz = SZ[obsel & 7];
+    int nb0 = ((obsel >> 5) & 7) << 13;
+    int nb1 = nb0 + ((((obsel >> 3) & 3) + 1) << 12);
 
+    // Sprites that survived the 32-per-line limit, kept around so the
+    // separate 34-sliver limit can be evaluated afterward.
+    struct VisSprite {
+        int xPos = 0, spW = 0, sprRow = 0, hflip = 0;
+        uint8_t tileNo = 0, attr = 0;
+        int chrBase = 0;
+        int totalSlivers = 0;
+        int acceptedSlivers = 0; // filled in by the 34-sliver pass below
+    };
+    std::vector<VisSprite> vis;
+    vis.reserve(32);
+
+    int count = 0;
     for (int s = 0; s < 128; s++) {
         int o4 = s << 2;
         int eb = (oam[0x200 + (s >> 2)] >> ((s & 3) << 1)) & 3;
@@ -280,32 +293,72 @@ int nb1 = nb0 + ((((obsel >> 3) & 3) + 1) << 12);
         uint8_t yPos = oam[o4 + 1];
         int row = (y - yPos) & 0xFF;
         if (row >= spH) continue;
-        if (count >= 32) break;
-        count++;
 
         uint8_t xLo = oam[o4];
         int xPos = (eb & 1) ? xLo - 256 : xLo;
-        if (xPos + spW <= 0 || xPos >= kScreenW) continue;
+
+        // Real hardware only counts onscreen sprites toward the 32-per-line
+        // limit, EXCEPT a PPU bug that also counts sprites at exactly
+        // X=-256 ($100) even though they're fully offscreen.
+        bool onscreen = !(xPos + spW <= 0 || xPos >= kScreenW);
+        bool xBugCase = (xPos == -256);
+        if (!onscreen && !xBugCase) continue;
+        if (count >= 32) break;
+        count++;
+        if (!onscreen) continue;
 
         uint8_t tileNo = oam[o4 + 2];
         uint8_t attr = oam[o4 + 3];
         int nameT = attr & 1;
-        int pal   = (attr >> 1) & 7;
-        int prio  = (attr >> 4) & 3;
         int hflip = (attr >> 6) & 1;
         int vflip = (attr >> 7) & 1;
 
-        int chrBase = nameT ? nb1 : nb0;
-        int sprRow = vflip ? spH - 1 - row : row;
+        VisSprite v;
+        v.xPos = xPos;
+        v.spW = spW;
+        v.sprRow = vflip ? spH - 1 - row : row;
+        v.hflip = hflip;
+        v.tileNo = tileNo;
+        v.attr = attr;
+        v.chrBase = nameT ? nb1 : nb0;
+        v.totalSlivers = (spW + 7) / 8;
+        vis.push_back(v);
+    }
 
-        for (int px = 0; px < spW; px++) {
-            int sx = xPos + px;
+    // ── 34-sliver-per-line limit ──────────────────────────────────────────
+    // A separate, stricter budget from the 32-sprite limit above: the
+    // scanline is chopped into 8px slivers and only 34 of them can be drawn.
+    // Per hardware, this is evaluated in REVERSE OAM order — the
+    // highest-index sprite claims budget first, so low-index (highest
+    // draw-priority) sprites are the ones that lose slivers once the
+    // budget runs out. Within a single sprite, slivers are consumed
+    // left-to-right in screen space, so an over-budget sprite loses its
+    // rightmost slivers first.
+    {
+        int budget = 34;
+        for (int i = static_cast<int>(vis.size()) - 1; i >= 0; i--) {
+            VisSprite& v = vis[i];
+            int take = std::min(v.totalSlivers, budget);
+            v.acceptedSlivers = take;
+            budget -= take;
+        }
+    }
+
+    // ── Draw pass — ascending OAM order so low index still wins overlaps ──
+    for (auto& v : vis) {
+        if (v.acceptedSlivers <= 0) continue;
+        int visibleW = std::min(v.spW, v.acceptedSlivers * 8);
+        int pal  = (v.attr >> 1) & 7;
+        int prio = (v.attr >> 4) & 3;
+
+        for (int px = 0; px < visibleW; px++) {
+            int sx = v.xPos + px;
             if (sx < 0 || sx >= kScreenW || out[sx].valid) continue;
-            int col = hflip ? spW - 1 - px : px;
-            int stX = (col >> 3) & 0xF, stY = (sprRow >> 3) & 0xF;
-            int ptX = col & 7, ptY = sprRow & 7;
-            int sub = ((((tileNo >> 4) + stY) & 0xF) << 4) | ((tileNo + stX) & 0xF);
-            int wa = (chrBase + (sub & 0xFF) * 16 + ptY) & 0x7FFF;
+            int col = v.hflip ? v.spW - 1 - px : px;
+            int stX = (col >> 3) & 0xF, stY = (v.sprRow >> 3) & 0xF;
+            int ptX = col & 7, ptY = v.sprRow & 7;
+            int sub = ((((v.tileNo >> 4) + stY) & 0xF) << 4) | ((v.tileNo + stX) & 0xF);
+            int wa = (v.chrBase + (sub & 0xFF) * 16 + ptY) & 0x7FFF;
             uint8_t p0 = vram[(wa << 1) & 0xFFFF];
             uint8_t p1 = vram[((wa << 1) + 1) & 0xFFFF];
             uint8_t p2 = vram[((wa + 8) << 1) & 0xFFFF];
@@ -345,7 +398,19 @@ std::array<PPU::OptCol, 2> PPU::optOffset(int tileCol) const {
     uint8_t bg3SC = regs[0x09];
     int mapBase = ((bg3SC >> 2) & 0x3F) << 10;
     int mapSzX  = (bg3SC & 1) ? 64 : 32;
-    int col     = (tileCol - 1) & (mapSzX - 1);
+    int mapSzY  = (bg3SC & 2) ? 64 : 32;
+
+    // BG3's own HOFS/VOFS pick which part of ITS tilemap the offset data
+    // comes from — low 3 bits are ignored (matches real hardware: fine
+    // scroll is meaningless for a whole-tile lookup). Previously this was
+    // hardcoded to column (tileCol-1) and rows 0/1, so any game using
+    // BG3HOFS/BG3VOFS to scroll or page-switch its offset data (including
+    // via HDMA) was reading the wrong tiles entirely.
+    int colBase = (tileCol - 1) + (bgH[2] >> 3);
+    int col     = colBase & (mapSzX - 1);
+    int rowBase = bgV[2] >> 3;
+    int rowH    = rowBase & (mapSzY - 1);
+    int rowV    = (rowBase + 1) & (mapSzY - 1); // spec: vertical row reads as if VOFS+8
 
     auto fetchEntry = [&](int row) -> uint16_t {
         int pgX = (col >> 5) & 1, pgY = (row >> 5) & 1;
@@ -356,13 +421,13 @@ std::array<PPU::OptCol, 2> PPU::optOffset(int tileCol) const {
     };
 
     if (mode == 4) {
-        uint16_t e = fetchEntry(0);
+        uint16_t e = fetchEntry(rowH);
         int val = e & 0x1FFF;
         bool toBG1 = e & 0x2000, toBG2 = e & 0x4000, isV = e & 0x8000;
         if (isV) { if (toBG1) out[0].v = val; if (toBG2) out[1].v = val; }
         else     { if (toBG1) out[0].h = val; if (toBG2) out[1].h = val; }
     } else {
-        uint16_t eh = fetchEntry(0), ev = fetchEntry(1);
+        uint16_t eh = fetchEntry(rowH), ev = fetchEntry(rowV);
         int hval = eh & 0x1FFF, vval = ev & 0x1FFF;
         if (eh & 0x2000) out[0].h = hval;
         if (eh & 0x4000) out[1].h = hval;
@@ -438,12 +503,22 @@ void PPU::renderScanline(int y) {
         {8,2,0,0}, {4,2,0,0}, {4,0,0,0}, {0,0,0,0},
     };
 
-    uint8_t cgwsel  = regs[0x30];
+uint8_t cgwsel  = regs[0x30];
     uint8_t cgadsub = regs[0x31];
     bool cmAdd   = !(cgadsub & 0x80);
     bool cmHalf  = (cgadsub & 0x40) != 0;
     int  cmEn    = cgadsub & 0x3F;
-    int  cmForce = (cgwsel >> 4) & 0x3;
+
+    // CGWSEL $2130: MMSS ..AD
+    //   bit0 (D) = direct color enable
+    //   bit1 (A) = Addend source: 0 = fixed color, 1 = sub screen
+    //   bits4-5 (SS) = sub screen "force transparent" region (color window)
+    //   bits6-7 (MM) = main screen "force black" region (color window)
+    // Region encoding for both MM and SS: 0=nowhere, 1=outside window,
+    // 2=inside window, 3=everywhere.
+    bool addendIsSubscreen = (cgwsel & 0x02) != 0;
+    int  mainBlackSel      = (cgwsel >> 6) & 0x3;
+    int  subTransSel       = (cgwsel >> 4) & 0x3;
 
     bool anyWin = (regs[0x23] | regs[0x24] | regs[0x25]) != 0;
     uint8_t tmWin = regs[0x2E];
@@ -452,9 +527,20 @@ void PPU::renderScanline(int y) {
 
     std::array<bool, 6> haveWin{};
     std::array<std::array<uint8_t, kScreenW>, 6> layerWin{};
-    auto getWin = [&](int li) -> const std::array<uint8_t, kScreenW>& {
+auto getWin = [&](int li) -> const std::array<uint8_t, kScreenW>& {
         if (!haveWin[li]) { layerWin[li] = buildWinMask(li); haveWin[li] = true; }
         return layerWin[li];
+    };
+
+    // Evaluates one of CGWSEL's MM/SS region selectors against the color
+    // window (window index 5) at column x. sel: 0=nowhere,1=outside,
+    // 2=inside,3=everywhere.
+    auto regionActive = [&](int sel, int x) -> bool {
+        if (sel == 0) return false;
+        if (sel == 3) return true;
+        const auto& cwm = getWin(5);
+        bool inside = cwm[x] != 0;
+        return sel == 2 ? inside : !inside;
     };
 
     std::array<std::array<Px, kScreenW>, 4> bgL{};
@@ -480,18 +566,24 @@ void PPU::renderScanline(int y) {
     }
     if ((tm | ts) & 0x10) { sprL = sprLine(y); haveSpr = true; }
 
-    auto layerList = layers(mode);
-    uint16_t subBD = (cgwsel & 0x02) ? fixedColor : cgram[0];
+auto layerList = layers(mode);
+    // Default sub-screen source: backdrop when Addend=subscreen (normal
+    // sub-screen compositing falls through to CGRAM 0 when nothing draws),
+    // or the fixed color when Addend=fixed color.
+    uint16_t subBD = addendIsSubscreen ? cgram[0] : fixedColor;
 
     // Direct Color mode (CGWSEL bit0): bypasses CGRAM for 8bpp BG1 in modes
     // 3/4 and for Mode 7 BG1/EXTBG-BG2 — those layers never use a CGRAM
     // sub-palette on real hardware, so `cgi` there is already the raw
     // 3/3/2-bit-packed index; just spread it into a 5/5/5 color directly.
-    bool directColorEn = (cgwsel & 0x01) != 0;
-    auto directColor = [](uint8_t idx) -> uint16_t {
-        int r = (idx & 0x07) << 2;
-        int g = (idx & 0x38) >> 1;
-        int b = (idx & 0xC0) >> 3;
+bool directColorEn = (cgwsel & 0x01) != 0;
+    // attr bit0=r, bit1=g, bit2=b — the tilemap's palette-selection field,
+    // repurposed as extra low-order color bits in Direct Color mode (see
+    // Tiles wiki: "RRRr0 GGGg0 BBb00").
+    auto directColor = [](uint8_t idx, uint8_t attr) -> uint16_t {
+        int r = ((idx & 0x07) << 2) | (((attr >> 0) & 1) << 1);
+        int g = (((idx >> 3) & 0x07) << 2) | (((attr >> 1) & 1) << 1);
+        int b = (((idx >> 6) & 0x03) << 3) | (((attr >> 2) & 1) << 2);
         return static_cast<uint16_t>(r | (g << 5) | (b << 10));
     };
     auto isDirectLayer = [&](int layerIdx) {
@@ -499,14 +591,16 @@ void PPU::renderScanline(int y) {
     };
 
     for (int x = 0; x < kScreenW; x++) {
-        int mainCGI = 0, mainLayer = -1;
+        int mainCGI = 0, mainLayer = -1; uint8_t mainAttr = 0;
         for (auto& layer : layerList) {
             int lIdx = layer.isSprite == 1 ? 4 : layer.idx;
             int tmBit = layer.isSprite == 1 ? 0x10 : (1 << layer.idx);
             if (!(tm & tmBit)) continue;
-            if (needWin && (tmWin & tmBit)) {
+if (needWin && (tmWin & tmBit)) {
                 const auto& wm = getWin(lIdx);
-                if (!wm[x]) continue;
+                // wm[x]==1 means "window is hiding this layer here" (per spec:
+                // "0 when showing, 1 when hiding") — skip when true, not false.
+                if (wm[x]) continue;
             }
             if (layer.isSprite == 1) {
                 if (!haveSpr) continue;
@@ -516,19 +610,19 @@ void PPU::renderScanline(int y) {
                 int bg = layer.idx;
                 if (!haveBg[bg]) continue;
                 const Px& px = bgL[bg][x];
-                if (px.valid && px.prio == layer.prio) { mainCGI = px.cgi; mainLayer = bg; break; }
+                if (px.valid && px.prio == layer.prio) { mainCGI = px.cgi; mainLayer = bg; mainAttr = px.attr; break; }
             }
         }
 
 uint16_t subC15 = subBD;
-        if (cmEn) {
+        if (addendIsSubscreen && cmEn) {
             for (auto& layer : layerList) {
                 int tsBit = layer.isSprite == 1 ? 0x10 : (1 << layer.idx);
                 if (!(ts & tsBit)) continue;
                 int lIdx = layer.isSprite == 1 ? 4 : layer.idx;
-                if (needWin && (tsWin & tsBit)) {
+if (needWin && (tsWin & tsBit)) {
                     const auto& wm = getWin(lIdx);
-                    if (!wm[x]) continue;
+                    if (wm[x]) continue;
                 }
                 if (layer.isSprite == 1) {
                     if (!haveSpr) continue;
@@ -539,26 +633,36 @@ uint16_t subC15 = subBD;
                     if (!haveBg[bg]) continue;
                     const Px& px = bgL[bg][x];
                     if (px.valid && px.prio == layer.prio) {
-                        subC15 = isDirectLayer(bg) ? directColor(px.cgi) : cgram[px.cgi];
+                        subC15 = isDirectLayer(bg) ? directColor(px.cgi, px.attr) : cgram[px.cgi];
                         break;
                     }
                 }
             }
         }
 
-        uint16_t c15 = isDirectLayer(mainLayer) ? directColor(static_cast<uint8_t>(mainCGI)) : cgram[mainCGI];
+// Sub screen "force transparent" region (CGWSEL SS bits): forces the
+        // math operand back to backdrop within the selected region. Only
+        // meaningful when Addend is actually the sub screen — fixed color
+        // has no "layers" for this to mask.
+        if (addendIsSubscreen && regionActive(subTransSel, x)) subC15 = cgram[0];
+
+        uint16_t c15 = isDirectLayer(mainLayer) ? directColor(static_cast<uint8_t>(mainCGI), mainAttr) : cgram[mainCGI];
+
+        // Main screen "force black" region (CGWSEL MM bits): replaces the
+        // main screen color with black within the selected region, BEFORE
+        // color math runs — math still applies against the forced-black
+        // value (this is the correct behavior; some older emulators like
+        // ZSNES got this wrong and skipped math entirely here).
+        if (regionActive(mainBlackSel, x)) c15 = 0;
 
         bool doCM = false;
-        if (cmForce != 3 && cmEn) {
+        // Sprites using palettes 0-3 always reject color math, regardless of
+        // the OBJ bit in CGADSUB — this lets a game mix opaque and
+        // color-math'd sprites on the main screen at the same time.
+        bool spriteRejectsCM = (mainLayer == 4 && mainCGI < 192);
+        if (cmEn && !spriteRejectsCM) {
             int lbit = mainLayer == -1 ? 0x20 : mainLayer == 4 ? 0x10 : (1 << mainLayer);
-            if (cmEn & lbit) {
-                if (cmForce == 0) {
-                    doCM = true;
-                } else {
-                    const auto& cwm = getWin(5);
-                    doCM = (cmForce == 1) ? (cwm[x] != 0) : (cwm[x] == 0);
-                }
-            }
+            if (cmEn & lbit) doCM = true;
         }
         if (doCM) c15 = blendC(c15, subC15, cmAdd ? 0 : 1, cmHalf);
 
