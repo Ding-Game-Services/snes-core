@@ -56,6 +56,7 @@ set(CORE_SOURCES
     src/CPU65816.cpp
     src/PPU.cpp
     src/SPC700.cpp
+    src/dsp.cpp
     src/SNES.cpp
     src/ding_core_snes.cpp
 )

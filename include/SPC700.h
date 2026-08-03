@@ -8,6 +8,8 @@
 #include <cstdint>
 #include <vector>
 
+#include "DSP.h"
+
 namespace ding::snes {
 
 class SPC700 {
@@ -44,12 +46,18 @@ std::array<uint8_t, 128> dspRegs{};
     // "audible activity" tells us whether the SPC driver ever actually ran,
     // independent of whether real music comes out. Interleaved stereo,
     // drained by ding_core_snes.cpp via ding_read_audio_samples.
-    std::vector<float> audioBuf;
+ std::vector<float> audioBuf;
     void genAudio(int masterClocks);
+
+    // Real S-DSP mixer/synth — replaces the diagnostic tone stub as of
+    // Milestone A. Constructed against this SPC700's own dspRegs/ram so
+    // register writes ($F2/$F3 IO ports) and KON/KOFF edges reach it
+    // immediately with no extra plumbing.
+    DSP dsp{dspRegs, ram};
 
 private:
     double audioAcc  = 0.0;
-    double tonePhase = 0.0;
+    double tonePhase = 0.0; // no longer used by genAudio; kept for save-state layout compatibility until next state-format bump
 
     uint8_t rd(uint16_t addr);
     void    wr(uint16_t addr, uint8_t val);

@@ -135,10 +135,29 @@ void DSP::mixSample(float& outL, float& outR) {
             v.posInBlock++;
             if (v.posInBlock >= 16) {
                 v.posInBlock = 0;
-                bool wasEnd = decodeBrrBlock(v, v.blockAddr); // decodes NEXT block below
-                // Note: decodeBrrBlock above actually decoded the block at
-                // the OLD v.blockAddr again; advance first, then decode.
-                (void)wasEnd;
+
+                // The block we just finished playing is still the one
+                // decodeBrrBlock last decoded into v.decoded[]/v.hist —
+                // re-read its header here (cheap: 1 byte) to get END/LOOP,
+                // since Voice doesn't cache them past decode.
+                uint8_t finishedHeader = rd(v.blockAddr);
+                bool finishedEnd  = (finishedHeader & 0x1) != 0;
+                bool finishedLoop = (finishedHeader & 0x2) != 0;
+
+                if (finishedEnd) {
+                    if (finishedLoop) {
+                        uint16_t startAddr, loopAddr;
+                        sourceDirEntry(regs[base + vSRCN], startAddr, loopAddr);
+                        v.blockAddr = loopAddr;
+                    } else {
+                        v.active = false;
+                        regs[kENDX] |= (1 << i);
+                        break; // stop advancing a now-inactive voice
+                    }
+                } else {
+                    v.blockAddr = (v.blockAddr + 9) & 0xFFFF;
+                }
+                decodeBrrBlock(v, v.blockAddr);
             }
         }
     }

@@ -54,8 +54,24 @@ void SPC700::ioWrite(uint16_t addr, uint8_t val) {
             if (val & 0x10) { inPorts[0] = 0; inPorts[1] = 0; }
             if (val & 0x20) { inPorts[2] = 0; inPorts[3] = 0; }
             break;
-        case 0x00F2: dspAddr = val; break;
-        case 0x00F3: if (!(dspAddr & 0x80)) dspRegs[dspAddr & 0x7F] = val; break;
+case 0x00F2: dspAddr = val; break;
+        case 0x00F3: {
+            if (dspAddr & 0x80) break; // upper-bit addresses are read-only mirrors
+            uint8_t reg = dspAddr & 0x7F;
+            uint8_t prev = dspRegs[reg];
+            dspRegs[reg] = val;
+            // KON ($4C) / KOFF ($5C): act on newly-set bits only, matching
+            // hardware edge-triggering (writing the same bit again does
+            // nothing until it's cleared and re-set).
+            if (reg == 0x4C) {
+                uint8_t newlySet = val & ~prev;
+                for (int i = 0; i < 8; i++) if (newlySet & (1 << i)) dsp.keyOn(i);
+            } else if (reg == 0x5C) {
+                uint8_t newlySet = val & ~prev;
+                for (int i = 0; i < 8; i++) if (newlySet & (1 << i)) dsp.keyOff(i);
+            }
+            break;
+        }
         case 0x00F4: outPorts[0] = val; break;
         case 0x00F5: outPorts[1] = val; break;
         case 0x00F6: outPorts[2] = val; break;
@@ -81,18 +97,12 @@ void SPC700::genAudio(int masterClocks) {
     static constexpr double kSampleRatio = 32000.0 / 21477272.0;
     audioAcc += masterClocks * kSampleRatio;
 
-    bool active = dspRegs[0x4C] != 0; // KON register — any voice key-on
-
     while (audioAcc >= 1.0) {
         audioAcc -= 1.0;
-        float s = 0.0f;
-        if (active) {
-            tonePhase += 440.0 / 32000.0; // fixed 440Hz blip, not derived from real pitch regs
-            if (tonePhase >= 1.0) tonePhase -= 1.0;
-            s = (tonePhase < 0.5) ? 0.15f : -0.15f; // quiet — this is a diagnostic, not music
-        }
-        audioBuf.push_back(s); // L
-        audioBuf.push_back(s); // R
+        float l = 0.0f, r = 0.0f;
+        dsp.mixSample(l, r);
+        audioBuf.push_back(l);
+        audioBuf.push_back(r);
     }
 
     // Cap growth in case the frontend falls behind on draining (~1s of audio).
