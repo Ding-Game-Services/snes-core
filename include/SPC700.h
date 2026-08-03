@@ -8,7 +8,7 @@
 #include <cstdint>
 #include <vector>
 
-#include "DSP.h"
+#include "dsp.h"
 
 namespace ding::snes {
 
