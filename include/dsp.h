@@ -1,9 +1,13 @@
 // ── DSP.h ────────────────────────────────────────────────────────────────────
 // D!NG SNES core — S-DSP (SPC700's audio mixer/synth chip).
 // Milestone A: BRR sample decode + 8-voice playback + flat-gain mixing.
-// NOT YET IMPLEMENTED (Milestone B): ADSR/GAIN envelopes, Gaussian
-// interpolation (currently nearest-neighbor), echo/FIR, noise generator,
-// pitch modulation (PMON). KOFF currently hard-mutes instead of releasing.
+// Milestone B: full ADSR + GAIN envelope path (Attack/Decay/Sustain/
+// Release, plus all 4 GAIN modes), Gaussian-shaped 4-tap interpolation
+// (dynamically normalized approximation of the hardware LUT — see
+// gaussianInterp() in dsp.cpp), PMON pitch modulation, and NON noise
+// generation + FLG soft-reset/mute/noise-clock. KOFF ramps via Release
+// instead of hard-muting.
+// NOT YET IMPLEMENTED: echo/FIR (EVOL/EON/ESA/EDL/EFB, FLG bit5 no-op).
 // No GPL code — BRR decode formulas are from Nintendo's own published S-DSP
 // documentation (widely mirrored on hardware reference wikis), not lifted
 // from any existing emulator's source.
@@ -45,21 +49,80 @@ private:
         int16_t decoded[16] = {};    // current block's 16 decoded PCM samples
         int16_t hist1 = 0, hist2 = 0; // BRR predictor history (persists across blocks)
 
-        uint32_t pitchCounter = 0;   // 12.12-ish fixed point accumulator, see mixSample
+uint32_t pitchCounter = 0;   // 12.12-ish fixed point accumulator, see mixSample
 
         bool loopFlag = false;       // this block is flagged as the loop point
+
+// ── ADSR/GAIN envelope (Milestone B) ──────────────────────────────
+        // envelope is the 11-bit (0-0x7FF) internal value; VxENVX exposes
+        // its upper 7 bits. envState (Attack/Decay/Sustain/Release) only
+        // drives playback when VxADSR1 bit7 is set; otherwise VxGAIN's
+        // direct/linear/bent-line/exponential modes take over — see
+        // DSP::tickEnvelope. Release (from KOFF) overrides either path.
+        enum class EnvState { Attack, Decay, Sustain, Release };
+        EnvState envState = EnvState::Release;
+int      envelope = 0;      // 0-0x7FF
+        int      envCounter = 0;    // samples remaining until next envelope tick
+
+        // Last 4 raw decoded samples in playback order (index 3 = most
+        // recently reached), used for Gaussian interpolation. Persists
+        // across BRR block boundaries same as hist1/hist2 above.
+        int16_t interpHist[4] = {0, 0, 0, 0};
     };
 
-    std::array<Voice, 8> voices{};
+    // Anomie's S-DSP rate-to-period table (samples per envelope tick, index
+    // 0-31). Index 0 = never ticks. Shared by ADSR attack/decay/sustain and
+    // (later) GAIN's non-fixed modes. Public hardware-timing constants, not
+    // derived from any emulator's source.
+    static constexpr int kEnvRatePeriod[32] = {
+        0, 2048, 1536, 1280, 1024, 768, 640, 512,
+        384, 320, 256, 192, 160, 128, 96, 80,
+        64, 48, 40, 32, 24, 20, 16, 12,
+        10, 8, 6, 5, 4, 3, 2, 1
+    };
+
+std::array<Voice, 8> voices{};
+
+    // Shared 15-bit noise LFSR (S-DSP has one noise generator, not one per
+    // voice — NON just routes it into whichever voices request it).
+    // Seeded nonzero: an all-zero LFSR would lock up and never produce
+    // noise again.
+    uint16_t noiseLfsr = 0x4000;
+    int      noiseCounter = 0;
 
     std::array<uint8_t, 128>&      regs; // SPC700::dspRegs
     std::array<uint8_t, 0x10000>&  aram; // SPC700::ram (DSP sees the full 64KB address space)
 
     uint8_t  rd(uint16_t addr) const { return aram[addr & 0xFFFF]; }
 
-    // Decodes the 9-byte BRR block at `addr` into v.decoded[], updating
+ // Decodes the 9-byte BRR block at `addr` into v.decoded[], updating
     // v.hist1/hist2. Returns true if this block's END flag was set.
     bool decodeBrrBlock(Voice& v, uint32_t addr);
+
+// Advances voice `i`'s ADSR envelope by one sample and writes the
+    // resulting upper-7-bits value to VxENVX ($x8). Called once per sample
+    // from mixSample(), before the envelope is applied to the decoded PCM.
+    void tickEnvelope(int voiceIdx, Voice& v, int base);
+
+    // 4-tap interpolation between the last 4 raw decoded samples, using the
+    // sub-sample fractional position (0-255) derived from the pitch
+    // counter. See dsp.cpp for why this uses a Gaussian-shaped kernel with
+    // dynamic per-sample normalization rather than the exact hardware LUT.
+ static int16_t gaussianInterp(const int16_t hist[4], int frac);
+    static void    pushInterpHist(Voice& v, int16_t sample);
+
+    // Advances the shared noise LFSR by one step when FLG's noise-clock
+    // field ($6C bits 0-4, same rate table as envelopes) says it's due.
+    // Best-effort reconstruction of the documented S-DSP noise algorithm
+    // (15-bit Fibonacci LFSR, taps at bit0/bit1) rather than a verified
+    // hardware trace — produces correctly-shaped pseudorandom noise even
+    // if the exact bit sequence doesn't match real silicon cycle-for-cycle.
+    void tickNoise();
+
+    // Converts the current 15-bit LFSR value to a signed 16-bit sample,
+    // same scale as a decoded BRR sample, so it can substitute for `cur`
+    // in mixSample without special-casing downstream envelope/VOL math.
+    static int16_t noiseSample(uint16_t lfsr);
 
     // Reads this voice's 4-byte entry from the sample directory (DIR reg
     // $5D * 0x100 + srcn*4) -> {startAddr, loopAddr}.

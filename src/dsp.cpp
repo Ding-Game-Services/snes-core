@@ -13,6 +13,8 @@ constexpr int kEVOLL = 0x2C, kEVOLR = 0x3C; // echo — unused until Milestone B
 constexpr int kKON   = 0x4C;
 constexpr int kKOFF  = 0x5C;
 constexpr int kFLG   = 0x6C;
+constexpr int kPMON  = 0x2D;
+constexpr int kNON   = 0x3D;
 constexpr int kENDX  = 0x7C;
 constexpr int kDIR   = 0x5D;
 constexpr int kESA   = 0x6D; // echo start — unused until Milestone B
@@ -21,6 +23,7 @@ constexpr int kEDL   = 0x7D; // echo delay — unused until Milestone B
 // Per-voice register offsets, add voice*0x10
 constexpr int vVOLL = 0x00, vVOLR = 0x01, vPITCHL = 0x02, vPITCHH = 0x03;
 constexpr int vSRCN = 0x04, vADSR1 = 0x05, vADSR2 = 0x06, vGAIN = 0x07;
+constexpr uint8_t kAdsrEnable = 0x80; // VxADSR1 bit 7
 constexpr int vENVX = 0x08, vOUTX = 0x09;
 }
 
@@ -89,46 +92,243 @@ void DSP::keyOn(int voice) {
     v.pitchCounter = 0;
     decodeBrrBlock(v, v.blockAddr);
 
+    // KON resets the envelope to 0 and, if ADSR is enabled, starts the
+    // Attack phase. GAIN-mode voices (ADSR1 bit7 clear) just sit at 0 until
+    // the GAIN follow-up patch lands.
+ v.envelope = 0;
+    v.envCounter = 0;
+    v.envState = Voice::EnvState::Attack;
+
+    // Prime interpolation history so the first few output samples aren't
+    // pulled toward zero by stale/zeroed taps.
+    v.interpHist[0] = v.interpHist[1] = v.interpHist[2] = v.interpHist[3] = v.decoded[0];
+
     // Clear this voice's END flag in ENDX on key-on (matches hardware).
     regs[kENDX] &= ~(1 << voice);
 }
 
 void DSP::keyOff(int voice) {
     if (voice < 0 || voice >= 8) return;
-    // TODO(Milestone B): real ADSR release ramp instead of a hard cut.
-    voices[voice].active = false;
+    // Per S-DSP spec, KOFF moves the voice to the Release envelope state
+    // (linear -8/sample) regardless of ADSR-enable/GAIN mode. The voice
+    // stays active — and keeps decoding/playing BRR — until tickEnvelope
+    // drives its envelope to 0, at which point mixSample deactivates it.
+    voices[voice].envState = Voice::EnvState::Release;
+}
+
+void DSP::pushInterpHist(Voice& v, int16_t sample) {
+    v.interpHist[0] = v.interpHist[1];
+    v.interpHist[1] = v.interpHist[2];
+    v.interpHist[2] = v.interpHist[3];
+    v.interpHist[3] = sample;
+}
+
+int16_t DSP::gaussianInterp(const int16_t hist[4], int frac) {
+    // Lazily-built 512-entry symmetric Gaussian-shaped kernel, indexed the
+    // same way the documented hardware algorithm indexes its ROM LUT (mirror
+    // pairs around the center for the 4 taps). This is a smooth analytic
+    // approximation, NOT a byte-for-byte copy of the real S-DSP table — see
+    // the header comment. To avoid amplitude drift from that imprecision,
+    // the 4 tap weights below are normalized against their own sum at
+    // runtime rather than trusting a fixed >>11 shift.
+    static int16_t table[512];
+    static bool built = false;
+    if (!built) {
+        for (int i = 0; i < 512; i++) {
+            double x = (i - 255.5) / 90.0;
+            double g = std::exp(-0.5 * x * x);
+            table[i] = static_cast<int16_t>(g * 2048.0 + 0.5);
+        }
+        built = true;
+    }
+
+    frac &= 0xFF;
+    int32_t c0 = table[255 - frac];
+    int32_t c1 = table[511 - frac];
+    int32_t c2 = table[256 + frac];
+    int32_t c3 = table[frac];
+    int32_t sum = c0 + c1 + c2 + c3;
+    if (sum <= 0) return hist[3];
+
+    int64_t acc = static_cast<int64_t>(hist[0]) * c0 + static_cast<int64_t>(hist[1]) * c1 +
+                  static_cast<int64_t>(hist[2]) * c2 + static_cast<int64_t>(hist[3]) * c3;
+    return clamp16(static_cast<int32_t>(acc / sum));
+}
+
+void DSP::tickEnvelope(int voiceIdx, Voice& v, int base) {
+    // Release overrides everything else, ADSR-enabled or not: linear -8
+    // every sample, no rate table involved.
+    if (v.envState == Voice::EnvState::Release) {
+        v.envelope -= 8;
+        if (v.envelope <= 0) { v.envelope = 0; v.active = false; }
+        regs[base + vENVX] = static_cast<uint8_t>((v.envelope >> 4) & 0x7F);
+        return;
+    }
+
+ uint8_t adsr1 = regs[base + vADSR1];
+    if (!(adsr1 & kAdsrEnable)) {
+        uint8_t gain = regs[base + vGAIN];
+        if (!(gain & 0x80)) {
+            // Direct/fixed gain: bits 0-6 set the envelope immediately,
+            // no rate/counter involved. 7-bit value -> 11-bit envelope
+            // (same upper-bits relationship VxENVX exposes).
+            v.envelope = (gain & 0x7F) << 4;
+        } else {
+            int mode = (gain >> 5) & 0x3; // 0=lin dec, 1=exp dec, 2=lin inc, 3=bent-line inc
+            int rate = gain & 0x1F;
+            bool tick = false;
+            if (rate > 0 && kEnvRatePeriod[rate] > 0) {
+                if (++v.envCounter >= kEnvRatePeriod[rate]) { v.envCounter = 0; tick = true; }
+            }
+            if (tick) {
+                switch (mode) {
+                    case 0: // Linear decrease
+                        v.envelope -= 32;
+                        break;
+                    case 1: // Exponential decrease
+                        v.envelope -= ((v.envelope - 1) >> 8) + 1;
+                        break;
+                    case 2: // Linear increase
+                        v.envelope += 32;
+                        break;
+                    case 3: // Bent-line increase: +32/tick below 0x600, +8/tick above
+                        v.envelope += (v.envelope < 0x600) ? 32 : 8;
+                        break;
+                }
+                if (v.envelope < 0) v.envelope = 0;
+                if (v.envelope > 0x7FF) v.envelope = 0x7FF;
+            }
+        }
+        regs[base + vENVX] = static_cast<uint8_t>((v.envelope >> 4) & 0x7F);
+        return;
+    }
+
+    uint8_t adsr2 = regs[base + vADSR2];
+    int attackRate = adsr1 & 0x0F;
+    int decayRate  = (adsr1 >> 4) & 0x07;
+    int sustainLvl = (adsr2 >> 5) & 0x07;
+    int sustainRate = adsr2 & 0x1F;
+
+    int rateIndex = 0; // 0 = table entry meaning "never ticks"
+    switch (v.envState) {
+        case Voice::EnvState::Attack:
+            rateIndex = (attackRate == 15) ? 31 : (attackRate * 2 + 1);
+            break;
+        case Voice::EnvState::Decay:
+            rateIndex = 0x10 | (decayRate << 1);
+            break;
+        case Voice::EnvState::Sustain:
+            rateIndex = sustainRate;
+            break;
+        default: break;
+    }
+
+    bool tick = false;
+    if (rateIndex > 0 && kEnvRatePeriod[rateIndex] > 0) {
+        if (++v.envCounter >= kEnvRatePeriod[rateIndex]) { v.envCounter = 0; tick = true; }
+    }
+
+    if (tick) {
+        if (v.envState == Voice::EnvState::Attack) {
+            v.envelope += (attackRate == 15) ? 1024 : 32;
+            if (v.envelope >= 0x7FF) { v.envelope = 0x7FF; v.envState = Voice::EnvState::Decay; }
+        } else if (v.envState == Voice::EnvState::Decay) {
+            // Exponential decrease: env -= ((env - 1) >> 8) + 1
+            v.envelope -= ((v.envelope - 1) >> 8) + 1;
+            if (v.envelope < 0) v.envelope = 0;
+            if ((v.envelope >> 8) <= sustainLvl) v.envState = Voice::EnvState::Sustain;
+        } else if (v.envState == Voice::EnvState::Sustain) {
+            v.envelope -= ((v.envelope - 1) >> 8) + 1;
+            if (v.envelope < 0) v.envelope = 0;
+        }
+    }
+
+    regs[base + vENVX] = static_cast<uint8_t>((v.envelope >> 4) & 0x7F);
+}
+
+void DSP::tickNoise() {
+    int rate = regs[kFLG] & 0x1F;
+    if (rate == 0 || kEnvRatePeriod[rate] == 0) return;
+    if (++noiseCounter < kEnvRatePeriod[rate]) return;
+    noiseCounter = 0;
+
+    // 15-bit Fibonacci LFSR: new top bit = XOR of the two lowest bits,
+    // shifted in from the top as the register shifts right.
+    uint16_t feedback = static_cast<uint16_t>((noiseLfsr ^ (noiseLfsr >> 1)) & 1) << 14;
+    noiseLfsr = static_cast<uint16_t>(((noiseLfsr >> 1) | feedback) & 0x7FFF);
+}
+
+int16_t DSP::noiseSample(uint16_t lfsr) {
+    // Treat the 15-bit LFSR value as signed (bit14 = sign), then scale up
+    // to the same ~16-bit range decoded BRR samples use so it drops into
+    // the envelope/VOL math in mixSample without special-casing.
+    int32_t signed15 = (lfsr & 0x4000) ? (static_cast<int32_t>(lfsr) - 0x8000) : static_cast<int32_t>(lfsr);
+    return clamp16(signed15 * 2);
 }
 
 void DSP::mixSample(float& outL, float& outR) {
+    uint8_t flg = regs[kFLG];
+
+    // FLG bit7: soft reset. Hardware also resets various internal DSP
+    // state on this; we take the audible/practical effect (hard silence,
+    // no voice processing this sample) since a byte-for-byte trace of
+    // everything real SOFT RESET touches wasn't available to verify against.
+    if (flg & 0x80) { outL = 0.0f; outR = 0.0f; return; }
+
+    tickNoise();
+
     int32_t mixL = 0, mixR = 0;
+
+    // Previous voice's enveloped output (pre-VOL), used by PMON pitch
+    // modulation for the *next* voice in processing order. A silent/inactive
+    // voice contributes 0, matching hardware (no modulation from silence).
+    int32_t prevVoiceOut = 0;
 
     for (int i = 0; i < 8; i++) {
         Voice& v = voices[i];
-        if (!v.active) continue;
+        if (!v.active) { prevVoiceOut = 0; continue; }
 
-        int base = i * 0x10;
-        int16_t cur = v.decoded[v.posInBlock];
+ int base = i * 0x10;
+        int frac = (v.pitchCounter >> 4) & 0xFF; // sub-sample phase, 0-255
+        bool useNoise = (regs[kNON] & (1 << i)) != 0;
+        int16_t cur = useNoise ? noiseSample(noiseLfsr) : gaussianInterp(v.interpHist, frac);
 
-        // TODO(Milestone B): Gaussian 4-tap interpolation instead of
-        // nearest-neighbor. Audible as slightly gritty pitch-shifted notes
-        // until that lands — correct pitch/timing either way.
+        tickEnvelope(i, v, base);
+        if (!v.active) { prevVoiceOut = 0; continue; } // Release ramp just hit 0 — drop this sample
+
+        // Envelope (0-0x7FF, 11-bit) scales the sample before VOL, matching
+        // "OUTX ... after the envelope has been applied ... before VOL".
+        int32_t enveloped = (static_cast<int32_t>(cur) * v.envelope) >> 11;
+        int32_t thisVoiceOut = enveloped; // captured before VOL, for next voice's PMON
+
         int8_t volL = static_cast<int8_t>(regs[base + vVOLL]);
         int8_t volR = static_cast<int8_t>(regs[base + vVOLR]);
 
-        // TODO(Milestone B): ADSR/GAIN envelope shaping. Flat full-scale
-        // playback for now, so expect clicky note-on/off transitions.
-        int32_t sL = (cur * volL) >> 7;
-        int32_t sR = (cur * volR) >> 7;
+        int32_t sL = (enveloped * volL) >> 7;
+        int32_t sR = (enveloped * volR) >> 7;
         mixL += sL;
         mixR += sR;
 
-        regs[base + vOUTX] = static_cast<uint8_t>((cur >> 8) & 0xFF);
+        regs[base + vOUTX] = static_cast<uint8_t>((enveloped >> 8) & 0xFF);
 
-        // Advance playback position. PITCH is a 14-bit value where 0x1000
+// Advance playback position. PITCH is a 14-bit value where 0x1000
         // represents "1 source sample per output sample" (i.e. no pitch
         // shift), matching real S-DSP semantics.
         uint16_t pitch = (static_cast<uint16_t>(regs[base + vPITCHH] & 0x3F) << 8) |
                           regs[base + vPITCHL];
+
+        // PMON pitch modulation: voice i (i>0) has its pitch nudged by the
+        // previous voice's amplitude this sample, when PMON bit i is set.
+        // Classic FM-ish trick (bells, breathy leads) — voice 0 can't be
+        // modulated since there's no voice -1.
+        uint8_t pmon = regs[kPMON];
+        if (i > 0 && (pmon & (1 << i))) {
+            int32_t factor = prevVoiceOut >> 5; // scale to a workable modulation range
+            int32_t modPitch = static_cast<int32_t>(pitch) +
+                                ((static_cast<int32_t>(pitch) * factor) >> 10);
+            pitch = static_cast<uint16_t>(std::clamp(modPitch, 0, 0x3FFF));
+        }
+
         v.pitchCounter += pitch;
         while (v.pitchCounter >= 0x1000) {
             v.pitchCounter -= 0x1000;
@@ -159,7 +359,10 @@ void DSP::mixSample(float& outL, float& outR) {
                 }
                 decodeBrrBlock(v, v.blockAddr);
             }
+            pushInterpHist(v, v.decoded[v.posInBlock]);
         }
+
+        prevVoiceOut = thisVoiceOut;
     }
 
     int8_t mvolL = static_cast<int8_t>(regs[kMVOLL]);
@@ -167,8 +370,13 @@ void DSP::mixSample(float& outL, float& outR) {
     mixL = (mixL * mvolL) >> 7;
     mixR = (mixR * mvolR) >> 7;
 
-    outL = std::clamp(mixL, -32768, 32767) / 32768.0f;
+outL = std::clamp(mixL, -32768, 32767) / 32768.0f;
     outR = std::clamp(mixR, -32768, 32767) / 32768.0f;
+
+    // FLG bit6: mute. Forces the DAC output to 0 without stopping voice
+    // processing — envelopes/noise/BRR playback above all keep running so
+    // un-muting mid-note resumes cleanly instead of restarting voices.
+    if (flg & 0x40) { outL = 0.0f; outR = 0.0f; }
 }
 
 } // namespace ding::snes
