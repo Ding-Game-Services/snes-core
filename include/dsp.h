@@ -87,8 +87,15 @@ std::array<Voice, 8> voices{};
     // voice — NON just routes it into whichever voices request it).
     // Seeded nonzero: an all-zero LFSR would lock up and never produce
     // noise again.
-    uint16_t noiseLfsr = 0x4000;
+uint16_t noiseLfsr = 0x4000;
     int      noiseCounter = 0;
+
+    // KON/KOFF ($4C/$5C) are only sampled once every 2 output samples on
+    // real hardware (SNESdev Errata, S-SMP section) — writes to those regs
+    // just update the byte; actual key-on/key-off happens in mixSample()
+    // at the next poll boundary. See mixSample() for why this matters.
+    uint8_t lastPolledKon = 0, lastPolledKoff = 0;
+    int     konPollCounter = 0;
 
     std::array<uint8_t, 128>&      regs; // SPC700::dspRegs
     std::array<uint8_t, 0x10000>&  aram; // SPC700::ram (DSP sees the full 64KB address space)
@@ -128,7 +135,17 @@ std::array<Voice, 8> voices{};
     // $5D * 0x100 + srcn*4) -> {startAddr, loopAddr}.
     void sourceDirEntry(uint8_t srcn, uint16_t& startAddr, uint16_t& loopAddr) const;
 
-    static int16_t clamp16(int32_t v);
+static int16_t clamp16(int32_t v);
+
+public:
+    // Read-only per-voice snapshot for diagnostics.
+    struct VoiceDiag {
+        bool active; int envState; int envelope; bool loopFlag; uint32_t blockAddr;
+    };
+    VoiceDiag voiceDiag(int i) const {
+        const Voice& v = voices[i];
+        return { v.active, static_cast<int>(v.envState), v.envelope, v.loopFlag, v.blockAddr };
+    }
 };
 
 } // namespace ding::snes

@@ -267,6 +267,25 @@ int16_t DSP::noiseSample(uint16_t lfsr) {
 }
 
 void DSP::mixSample(float& outL, float& outR) {
+    // KON/KOFF poll — every 2nd sample, matching real hardware. Applying
+    // these instantly at write-time (old behavior) meant a driver writing
+    // KOFF then KON for the same voice within a sample or two — a common
+    // way to retrigger a note — could get silenced or skipped instead of
+    // the note simply continuing, since we'd process each edge separately
+    // rather than as hardware's coalesced once-per-2-samples snapshot.
+    if ((konPollCounter++ & 1) == 0) {
+        uint8_t kon = regs[kKON];
+        uint8_t koff = regs[kKOFF];
+        uint8_t newKon = kon & static_cast<uint8_t>(~lastPolledKon);
+        uint8_t newKoff = koff & static_cast<uint8_t>(~lastPolledKoff);
+        for (int i = 0; i < 8; i++) {
+            if (newKon & (1 << i)) keyOn(i);
+            if (newKoff & (1 << i)) keyOff(i);
+        }
+        lastPolledKon = kon;
+        lastPolledKoff = koff;
+    }
+
     uint8_t flg = regs[kFLG];
 
     // FLG bit7: soft reset. Hardware also resets various internal DSP

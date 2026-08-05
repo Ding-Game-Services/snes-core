@@ -55,21 +55,13 @@ void SPC700::ioWrite(uint16_t addr, uint8_t val) {
             if (val & 0x20) { inPorts[2] = 0; inPorts[3] = 0; }
             break;
 case 0x00F2: dspAddr = val; break;
-        case 0x00F3: {
+case 0x00F3: {
             if (dspAddr & 0x80) break; // upper-bit addresses are read-only mirrors
             uint8_t reg = dspAddr & 0x7F;
-            uint8_t prev = dspRegs[reg];
             dspRegs[reg] = val;
-            // KON ($4C) / KOFF ($5C): act on newly-set bits only, matching
-            // hardware edge-triggering (writing the same bit again does
-            // nothing until it's cleared and re-set).
-            if (reg == 0x4C) {
-                uint8_t newlySet = val & ~prev;
-                for (int i = 0; i < 8; i++) if (newlySet & (1 << i)) dsp.keyOn(i);
-            } else if (reg == 0x5C) {
-                uint8_t newlySet = val & ~prev;
-                for (int i = 0; i < 8; i++) if (newlySet & (1 << i)) dsp.keyOff(i);
-            }
+            // KON ($4C)/KOFF ($5C) are intentionally NOT applied here — see
+            // DSP::mixSample(), which now polls them at the correct 2-sample
+            // cadence instead of instantly on write.
             break;
         }
         case 0x00F4: outPorts[0] = val; break;

@@ -622,6 +622,33 @@ size_t ding_diag_handshake_state(char* buf, size_t buf_size) {
     return used < buf_size ? used : buf_size - 1;
 }
 
+// Always prints all 8 voices — for a silent game, "every voice inactive"
+// or "voices active but VOL=0/pitch=0" IS the diagnosis.
+size_t ding_diag_dsp_state(char* buf, size_t buf_size) {
+    if (!buf || buf_size == 0 || !g_snes) return 0;
+    const auto& regs = g_snes->spc.dspRegs;
+    size_t used = 0;
+
+    int n = std::snprintf(buf, buf_size, "MVOL L=%d R=%d FLG=%02X\n",
+        static_cast<int8_t>(regs[0x0C]), static_cast<int8_t>(regs[0x1C]), regs[0x6C]);
+    if (n > 0) used += static_cast<size_t>(n);
+
+    for (int i = 0; i < 8 && used < buf_size; i++) {
+        auto vd = g_snes->spc.diagDsp().voiceDiag(i);
+        int base = i * 0x10;
+        uint8_t adsr1 = regs[base + 0x05], adsr2 = regs[base + 0x06], gain = regs[base + 0x07];
+        uint16_t pitch = ((regs[base + 0x03] & 0x3F) << 8) | regs[base + 0x02];
+        n = std::snprintf(buf + used, buf_size - used,
+            "v%d act=%d st=%d env=%03X vL=%d vR=%d pitch=%04X srcn=%d adsr=%02X%02X gain=%02X mode=%s\n",
+            i, vd.active ? 1 : 0, vd.envState, vd.envelope,
+            static_cast<int8_t>(regs[base + 0x00]), static_cast<int8_t>(regs[base + 0x01]),
+            pitch, regs[base + 0x04], adsr1, adsr2, gain,
+            (adsr1 & 0x80) ? "ADSR" : "GAIN");
+        if (n > 0) used += static_cast<size_t>(n);
+    }
+    return used < buf_size ? used : buf_size - 1;
+}
+
 uint8_t ding_has_error() { return g_hasError ? 1 : 0; }
 
 const char* ding_diag_last_error() {

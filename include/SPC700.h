@@ -55,6 +55,9 @@ std::array<uint8_t, 128> dspRegs{};
     // immediately with no extra plumbing.
     DSP dsp{dspRegs, ram};
 
+public: // diagnostics only
+    DSP& diagDsp() { return dsp; }
+
 private:
     double audioAcc  = 0.0;
     double tonePhase = 0.0; // no longer used by genAudio; kept for save-state layout compatibility until next state-format bump
