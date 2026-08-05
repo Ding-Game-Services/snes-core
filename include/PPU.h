@@ -48,8 +48,12 @@ public:
     uint8_t cgramBuf = 0;
     bool    cgramLatch = false;
 
-    uint16_t oamByteAddr = 0;
+uint16_t oamByteAddr = 0;
     uint8_t  oamLow = 0;
+
+    // STAT77 ($213E) sprite-limit flags, refreshed once per scanline in sprLine().
+    bool spriteRangeOver = false; // >32 sprites intersected this line
+    bool spriteTimeOver  = false; // 34-sliver budget was exceeded
 
     std::array<uint16_t, 4> bgH{}, bgV{};
     uint8_t m7prev = 0, bgPrev = 0;
@@ -71,6 +75,24 @@ public:
 private:
     uint32_t toARGB(uint16_t bgr15) const;
     void     prefetchVRAM();
+
+    // Re-latches oamByteAddr from the last-written $2102/$2103 values.
+    // Hardware does this at the start of every vblank (and continuously
+    // during forced blank) so games can stream OAM from a fixed address
+    // each frame without rewriting $2102/$2103 every time.
+    void     reloadOamAddr();
+
+    // Real hardware ignores VRAM/OAM writes outside vblank+forceblank, and
+    // CGRAM writes outside vblank+hblank+forceblank — writing at the wrong
+    // time still advances the address/latch, but leaves RAM contents alone.
+    // Not gating this let writes that spill past the blanking window (e.g.
+    // from imprecise CPU cycle timing) corrupt whatever OAM/VRAM byte the
+    // address counter was sitting on — the likely cause of "correct shape,
+    // wrong content" sprite glitches (OAM entries ending up with stale/
+    // wrong tile numbers, like font tiles instead of character frames).
+    bool     forceBlank() const { return (regs[0x00] & 0x80) != 0; }
+    bool     oamVramAccessOk() const { return vblank || forceBlank(); }
+    bool     cgramAccessOk() const { return vblank || hblank || forceBlank(); }
 
     // One rendered background/sprite pixel: cgi = CGRAM color index, prio = priority bit.
     // `valid` mirrors the JS `out[x] === null` (no opaque pixel at this x).

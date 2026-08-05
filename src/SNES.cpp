@@ -90,11 +90,30 @@ void SNES::runFrame() {
     bool ppuDone = false;
     int guard = 0;
 
- while (!ppuDone && guard++ < 750000) {
+while (!ppuDone && guard++ < 750000) {
         int cyc = cpu.step();
-        int mc = cyc * ((bus.memsel & 1) ? 6 : 8);
+        // FastROM (6-clock) only applies to banks $80-$FF per MEMSEL; WRAM
+        // ($7E/$7F) and banks $00-$3F/$40-$7D are always 8-clock SlowROM
+        // speed regardless of MEMSEL. The old flat multiplier wrongly sped
+        // up code running from WRAM/low banks, throwing off HDMA/APU sync.
+        bool fastBank = (cpu.PBR >= 0x80) && (bus.memsel & 1);
+        int mc = cyc * (fastBank ? 6 : 8);
 
-spcAcc += mc * 0.04768;
+        // DRAM refresh: hardware steals 40 master clocks once, roughly mid-
+        // scanline, invisible to the game but very visible to anyone timing
+        // HDMA/raster splits against total line length. Approximated here
+        // as a one-time stall the first time this line's clock position
+        // crosses the halfway point of the 1364-clock line.
+        if (!refreshDone && (ppu.clk + static_cast<uint32_t>(mc) >= kLineMC / 2)) {
+            mc += 40;
+            refreshDone = true;
+        }
+
+// 1.024 MHz SPC700 clock / 21.4773 MHz master clock, kept at full
+        // precision rather than the old truncated 0.04768 literal — small
+        // per-instruction rounding compounds into audible drift over a frame.
+        static constexpr double kSpcClocksPerMaster = 1024000.0 / 21477272.0;
+        spcAcc += mc * kSpcClocksPerMaster;
 while (spcAcc >= 1.0) {
             int spcCy = spc.step();
             bus.apuOut[0] = spc.outPorts[0];
@@ -112,11 +131,12 @@ while (spcAcc >= 1.0) {
 
         ppuDone = ppu.advance(mc);
 
-        int sl = ppu.scanline;
+int sl = ppu.scanline;
         if (sl != lastScanline) {
             if (lastScanline < kScreenH && bus.hdmaen) bus.hdmaRun();
             bus.checkIRQ(lastScanline);
             lastScanline = sl;
+            refreshDone = false;
         }
     }
 }

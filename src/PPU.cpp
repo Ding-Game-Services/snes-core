@@ -24,6 +24,10 @@ void PPU::prefetchVRAM() {
     vramRdBuf = vram[a] | (vram[(a + 1) & 0xFFFF] << 8);
 }
 
+void PPU::reloadOamAddr() {
+    oamByteAddr = (((regs[0x03] & 1) << 8) | regs[0x02]) << 1;
+}
+
 uint8_t PPU::regRead(uint16_t addr) {
     int r = addr - 0x2100;
     switch (r) {
@@ -46,7 +50,10 @@ uint8_t PPU::regRead(uint16_t addr) {
             else { v = (cgram[cgramAddr & 0xFF] >> 8) & 0x7F; cgramAddr = (cgramAddr + 1) & 0xFF; cgramLatch = false; }
             return v;
         }
-        case 0x3E: return 0x01;
+case 0x3E:
+            // bit7=time over, bit6=range over, bit5=master/slave (unused),
+            // bits4-0=PPU1 open-bus/version (kept as the old hardcoded 0x01).
+            return (spriteTimeOver ? 0x80 : 0) | (spriteRangeOver ? 0x40 : 0) | 0x01;
         case 0x3F: {
             // STAT78: bit7=interlace field (unused, always 0 - no interlace),
             // bit5=PAL/NTSC (0=NTSC, hardcoded until region switching exists),
@@ -66,16 +73,15 @@ void PPU::regWrite(uint16_t addr, uint8_t val) {
     switch (r) {
         case 0x02: oamByteAddr = (((regs[0x03] & 1) << 8) | val) << 1; break;
         case 0x03: oamByteAddr = (((val & 1) << 8) | regs[0x02]) << 1; break;
-        case 0x04:
+case 0x04:
             if (oamByteAddr < 0x200) {
                 if (oamByteAddr & 1) {
-                    oam[oamByteAddr ^ 1] = oamLow;
-                    oam[oamByteAddr] = val;
+                    if (oamVramAccessOk()) { oam[oamByteAddr ^ 1] = oamLow; oam[oamByteAddr] = val; }
                 } else {
                     oamLow = val;
                 }
             } else if (oamByteAddr < 0x220) {
-                oam[oamByteAddr] = val;
+                if (oamVramAccessOk()) oam[oamByteAddr] = val;
             }
             oamByteAddr = (oamByteAddr + 1) & 0x3FF;
             break;
@@ -95,12 +101,12 @@ case 0x14: bgV[3] = ((val << 8) | bgPrev) & 0x3FF; bgPrev = val; break;
         }
         case 0x16: vramAddr = (vramAddr & 0x7F00) | val; prefetchVRAM(); break;
         case 0x17: vramAddr = (vramAddr & 0x00FF) | ((val & 0x7F) << 8); prefetchVRAM(); break;
-        case 0x18:
-            vram[(vramAddr << 1) & 0xFFFF] = val;
+case 0x18:
+            if (oamVramAccessOk()) vram[(vramAddr << 1) & 0xFFFF] = val;
             if (!vramIncOnHi) { vramAddr = (vramAddr + vramInc) & 0x7FFF; prefetchVRAM(); }
             break;
         case 0x19:
-            vram[((vramAddr << 1) + 1) & 0xFFFF] = val;
+            if (oamVramAccessOk()) vram[((vramAddr << 1) + 1) & 0xFFFF] = val;
             if (vramIncOnHi) { vramAddr = (vramAddr + vramInc) & 0x7FFF; prefetchVRAM(); }
             break;
         case 0x1B: m7a = (val << 8) | m7prev; m7prev = val; break;
@@ -110,10 +116,11 @@ case 0x14: bgV[3] = ((val << 8) | bgPrev) & 0x3FF; bgPrev = val; break;
         case 0x1F: m7cx = (val << 8) | m7prev; m7prev = val; break;
         case 0x20: m7cy = (val << 8) | m7prev; m7prev = val; break;
         case 0x21: cgramAddr = val; cgramLatch = false; break;
-        case 0x22:
+case 0x22:
             if (!cgramLatch) { cgramBuf = val; cgramLatch = true; }
             else {
-                cgram[cgramAddr & 0xFF] = ((val & 0x7F) << 8) | cgramBuf;
+                if (cgramAccessOk())
+                    cgram[cgramAddr & 0xFF] = ((val & 0x7F) << 8) | cgramBuf;
                 cgramAddr = (cgramAddr + 1) & 0xFF;
                 cgramLatch = false;
             }
@@ -268,8 +275,12 @@ std::array<PPU::Px, kScreenW> PPU::sprLine(int y) {
         {8,8,16,16}, {8,8,32,32}, {8,8,64,64}, {16,16,32,32},
         {16,16,64,64}, {32,32,64,64}, {16,32,32,64}, {16,32,32,64},
     };
-    const int* sz = SZ[obsel & 7];
-    int nb0 = ((obsel >> 5) & 7) << 13;
+    // OBJSEL layout is SSSN NbBB (bit7->bit0): size is bits 7-5, name base
+    // is bits 2-0. These were swapped — size table was indexed by the name
+    // base bits and vice versa, which silently pointed sprite tile fetches
+    // at the wrong (but valid-looking, cleanly-decoded) VRAM region.
+    const int* sz = SZ[(obsel >> 5) & 7];
+    int nb0 = (obsel & 7) << 13;
     int nb1 = nb0 + ((((obsel >> 3) & 3) + 1) << 12);
 
     // Sprites that survived the 32-per-line limit, kept around so the
@@ -302,8 +313,8 @@ std::array<PPU::Px, kScreenW> PPU::sprLine(int y) {
         // X=-256 ($100) even though they're fully offscreen.
         bool onscreen = !(xPos + spW <= 0 || xPos >= kScreenW);
         bool xBugCase = (xPos == -256);
-        if (!onscreen && !xBugCase) continue;
-        if (count >= 32) break;
+if (!onscreen && !xBugCase) continue;
+        if (count >= 32) { spriteRangeOver = true; break; }
         count++;
         if (!onscreen) continue;
 
@@ -335,10 +346,11 @@ std::array<PPU::Px, kScreenW> PPU::sprLine(int y) {
     // left-to-right in screen space, so an over-budget sprite loses its
     // rightmost slivers first.
     {
-        int budget = 34;
+int budget = 34;
         for (int i = static_cast<int>(vis.size()) - 1; i >= 0; i--) {
             VisSprite& v = vis[i];
             int take = std::min(v.totalSlivers, budget);
+            if (take < v.totalSlivers) spriteTimeOver = true;
             v.acceptedSlivers = take;
             budget -= take;
         }
@@ -697,6 +709,7 @@ bool PPU::advance(int masterClocks) {
         scanline++;
         if (scanline == kScreenH) {
             vblank = true;
+            reloadOamAddr();
             if (bus) bus->triggerNMI();
         }
         if (scanline >= kScanlines) {

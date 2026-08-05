@@ -82,6 +82,7 @@ public:
 
 private:
     double spcAcc = 0.0; // SPC700 clock accumulator (~0.04768 SPC cycles/master clock)
+    bool   refreshDone = false; // DRAM refresh stall consumed for the current scanline
 };
 
 } // namespace ding::snes
