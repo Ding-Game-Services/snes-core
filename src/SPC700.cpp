@@ -402,25 +402,25 @@ int SPC700::step() {
         case 0x50: { int off = sbyte(rd(PC++)); if (!V) { PC = (PC + off) & 0xFFFF; cy = 4; } else cy = 2; break; }
         case 0x30: { int off = sbyte(rd(PC++)); if ( N) { PC = (PC + off) & 0xFFFF; cy = 4; } else cy = 2; break; }
         case 0x10: { int off = sbyte(rd(PC++)); if (!N) { PC = (PC + off) & 0xFFFF; cy = 4; } else cy = 2; break; }
-        case 0x13: case 0x33: case 0x53: case 0x73: case 0x93: case 0xB3: case 0xD3: case 0xF3: {
+case 0x13: case 0x33: case 0x53: case 0x73: case 0x93: case 0xB3: case 0xD3: case 0xF3: {
             int bit = (op >> 5) & 7; uint16_t a = dp(); int off = sbyte(rd(PC++));
-            if ((rd(a) >> bit) & 1) { PC = (PC + off) & 0xFFFF; cy = 6; } else cy = 4;
+            if (!((rd(a) >> bit) & 1)) { PC = (PC + off) & 0xFFFF; cy = 7; } else cy = 5;
             break;
         }
-        case 0x03: case 0x23: case 0x43: case 0x63: case 0x83: case 0xA3: case 0xC3: case 0xE3: {
+case 0x03: case 0x23: case 0x43: case 0x63: case 0x83: case 0xA3: case 0xC3: case 0xE3: {
             int bit = (op >> 5) & 7; uint16_t a = dp(); int off = sbyte(rd(PC++));
-            if (!((rd(a) >> bit) & 1)) { PC = (PC + off) & 0xFFFF; cy = 6; } else cy = 4;
+            if ((rd(a) >> bit) & 1) { PC = (PC + off) & 0xFFFF; cy = 7; } else cy = 5;
             break;
         }
-        case 0x2E: { uint16_t a = dp(); int off = sbyte(rd(PC++)); if (A != rd(a)) { PC = (PC + off) & 0xFFFF; cy = 6; } else cy = 4; break; }
-        case 0xDE: { uint16_t a = dpx(); int off = sbyte(rd(PC++)); if (A != rd(a)) { PC = (PC + off) & 0xFFFF; cy = 7; } else cy = 5; break; }
-        case 0x6E: {
+        case 0x2E: { uint16_t a = dp(); int off = sbyte(rd(PC++)); if (A != rd(a)) { PC = (PC + off) & 0xFFFF; cy = 7; } else cy = 5; break; }
+        case 0xDE: { uint16_t a = dpx(); int off = sbyte(rd(PC++)); if (A != rd(a)) { PC = (PC + off) & 0xFFFF; cy = 8; } else cy = 6; break; }
+case 0x6E: {
             uint16_t a = dp(); uint8_t v = (rd(a) - 1) & 0xFF; wr(a, v);
             int off = sbyte(rd(PC++));
-            if (v != 0) { PC = (PC + off) & 0xFFFF; cy = 6; } else cy = 4;
+            if (v != 0) { PC = (PC + off) & 0xFFFF; cy = 7; } else cy = 5;
             break;
         }
-        case 0xFE: { Y = (Y - 1) & 0xFF; int off = sbyte(rd(PC++)); if (Y != 0) { PC = (PC + off) & 0xFFFF; cy = 4; } else cy = 2; break; }
+        case 0xFE: { Y = (Y - 1) & 0xFF; int off = sbyte(rd(PC++)); if (Y != 0) { PC = (PC + off) & 0xFFFF; cy = 6; } else cy = 4; break; }
         case 0x5F: { PC = abs_(); cy = 3; break; }
         case 0x1F: { uint16_t a = abs_(); PC = (rd((a + X + 1) & 0xFFFF) << 8) | rd((a + X) & 0xFFFF); cy = 6; break; }
         case 0x3F: {
