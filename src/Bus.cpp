@@ -267,11 +267,12 @@ void Bus::runDMA() {
             } else {
                 write(destAddr, read(src));
             }
-            if (!fixed) {
+if (!fixed) {
                 if (decr) src = (src & 0xFF0000) | ((src - 1) & 0xFFFF);
                 else      src = (src & 0xFF0000) | ((src + 1) & 0xFFFF);
             }
         }
+        c.size = 0; // hardware: count always ends at 0 on a clean (non-HDMA-interrupted) transfer
     }
     mdmaen = 0;
 }
@@ -288,7 +289,7 @@ void Bus::hdmaInit() {
         c.tableAddr    = c.srcAddr;
         c.tableBank    = c.srcBank;
         c.hdmaFinished = false;
-        c.lineCounter  = read((c.tableBank << 16) | c.tableAddr);
+c.lineCounter  = read((c.tableBank << 16) | c.tableAddr);
         c.tableAddr    = (c.tableAddr + 1) & 0xFFFF;
         if (c.lineCounter == 0) { c.hdmaFinished = true; continue; }
         if (c.ctrl & 0x40) {
@@ -298,6 +299,7 @@ void Bus::hdmaInit() {
             c.tableAddr = (c.tableAddr + 1) & 0xFFFF;
             c.indirectAddr = (hi << 8) | lo;
         }
+        c.doTransfer = true; // step 4 of the init process
     }
 }
 
@@ -316,27 +318,35 @@ void Bus::hdmaRun() {
         DmaChannel& c = dmaChannels[ch];
         if (c.hdmaFinished) continue;
 
-        const int* pattern = PATTERNS[c.ctrl & 7];
+const int* pattern = PATTERNS[c.ctrl & 7];
         int patLen = PATTERN_LEN[c.ctrl & 7];
         bool indirect = c.ctrl & 0x40;
 
-        for (int i = 0; i < patLen; i++) {
-            uint16_t dest = (0x2100 | c.destReg | pattern[i]) & 0xFFFF;
-            uint8_t byte;
-            if (indirect) {
-                byte = read((c.tableBank << 16) | (c.indirectAddr & 0xFFFF));
-                c.indirectAddr = (c.indirectAddr + 1) & 0xFFFF;
-            } else {
-                byte = read((c.tableBank << 16) | c.tableAddr);
-                c.tableAddr = (c.tableAddr + 1) & 0xFFFF;
+        // Steps 1-2: only transfer this scanline if Do Transfer is latched.
+        // Non-repeat entries transfer once then just count down silently.
+        if (c.doTransfer) {
+            for (int i = 0; i < patLen; i++) {
+                uint16_t dest = (0x2100 | c.destReg | pattern[i]) & 0xFFFF;
+                uint8_t byte;
+                if (indirect) {
+                    byte = read((c.tableBank << 16) | (c.indirectAddr & 0xFFFF));
+                    c.indirectAddr = (c.indirectAddr + 1) & 0xFFFF;
+                } else {
+                    byte = read((c.tableBank << 16) | c.tableAddr);
+                    c.tableAddr = (c.tableAddr + 1) & 0xFFFF;
+                }
+                write(dest, byte);
             }
-            write(dest, byte);
         }
 
+        // Step 3: decrement the 7-bit line counter.
         int lo7 = (c.lineCounter & 0x7F) - 1;
-        if (lo7 > 0) {
-            c.lineCounter = static_cast<uint8_t>((c.lineCounter & 0x80) | lo7);
-        } else {
+        // Step 4: next scanline's Do Transfer follows Repeat (bit7), unless
+        // a reload below overrides it back to true.
+        c.doTransfer = (c.lineCounter & 0x80) != 0;
+
+        // Step 5: reload when the counter hits zero.
+        if (lo7 <= 0) {
             c.lineCounter = read((c.tableBank << 16) | c.tableAddr);
             c.tableAddr   = (c.tableAddr + 1) & 0xFFFF;
             if (c.lineCounter == 0) { c.hdmaFinished = true; continue; }
@@ -347,6 +357,9 @@ void Bus::hdmaRun() {
                 c.tableAddr = (c.tableAddr + 1) & 0xFFFF;
                 c.indirectAddr = (hi << 8) | lo;
             }
+            c.doTransfer = true;
+        } else {
+            c.lineCounter = static_cast<uint8_t>((c.lineCounter & 0x80) | lo7);
         }
     }
 }

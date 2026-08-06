@@ -7,6 +7,13 @@ SPC700::SPC700() {
     for (int i = 0; i < 64; i++) ram[0xFFC0 + i] = kIplRom[i];
     ram[0xFFFE] = 0xC0; ram[0xFFFF] = 0xFF;
     PC = (ram[0xFFFF] << 8) | ram[0xFFFE];
+
+    // Real S-DSP power-on state: FLG ($6C) = 0xE0 (mute + echo-write-
+    // disabled + soft-reset). Without this, echo writes are live from
+    // sample zero with ESA=EDL=0, stomping ARAM $0000-$0003 every sample
+    // before any driver init code has run — corrupts direct-page zero,
+    // which most drivers use heavily, and can hang/crash boot broadly.
+    dspRegs[0x6C] = 0xE0;
 }
 
 uint8_t SPC700::rd(uint16_t addr) {
@@ -42,18 +49,18 @@ uint8_t SPC700::ioRead(uint16_t addr) {
 
 void SPC700::ioWrite(uint16_t addr, uint8_t val) {
     switch (addr) {
-        case 0x00F1:
-            ctrlReg = val;
-            for (int i = 0; i < 3; i++) {
-                bool wasEn = timerEn[i];
-                timerEn[i] = val & (1 << i);
-                if (!wasEn && timerEn[i]) {
-                    timerDiv[i] = 0; timerOut[i] = 0; timerCycles[i] = 0;
-                }
-            }
-            if (val & 0x10) { inPorts[0] = 0; inPorts[1] = 0; }
-            if (val & 0x20) { inPorts[2] = 0; inPorts[3] = 0; }
-            break;
+case 0x00F1:
+    ctrlReg = val;
+    for (int i = 0; i < 3; i++) {
+        timerEn[i] = val & (1 << i);
+        // Writing '1' to a timer bit (re)starts that timer even if it
+        // was already running — real hardware always resets on this,
+        // not just on an off->on transition.
+        if (timerEn[i]) { timerDiv[i] = 0; timerOut[i] = 0; timerCycles[i] = 0; }
+    }
+    if (val & 0x10) { inPorts[0] = 0; inPorts[1] = 0; }
+    if (val & 0x20) { inPorts[2] = 0; inPorts[3] = 0; }
+    break;
 case 0x00F2: dspAddr = val; break;
 case 0x00F3: {
             if (dspAddr & 0x80) break; // upper-bit addresses are read-only mirrors
@@ -367,7 +374,7 @@ int SPC700::step() {
         case 0x9F: A = sNZ(((A >> 4) | (A << 4)) & 0xFF); cy = 5; break;
         case 0xCF: { int r = (Y * A) & 0xFFFF; A = r & 0xFF; Y = (r >> 8) & 0xFF; N = (Y & 0x80) != 0; Z = (Y == 0); cy = 9; break; }
         case 0x9E: {
-            if (X == 0) { A = 0xFF; Y = A; N = 1; Z = 0; }
+            if (X == 0) { A = 0xFF; N = 1; Z = 0; }
             else {
                 int ya = (Y << 8) | A;
                 A = (ya / X) & 0xFF;
@@ -488,7 +495,7 @@ case 0x4E: { uint16_t a = abs_(); uint8_t v = rd(a); sNZ(A & v); wr(a, v & ~A); 
             timerCycles[i] += cy;
             while (timerCycles[i] >= thresh[i]) {
                 timerCycles[i] -= thresh[i];
-                timerDiv[i] = (timerDiv[i] + 1) & 0xFF;
+                timerDiv[i]++;
                 uint16_t target = timerTarget[i] ? timerTarget[i] : 0x100;
                 if (timerDiv[i] >= target) {
                     timerDiv[i] = 0;

@@ -90,6 +90,14 @@ std::array<Voice, 8> voices{};
 uint16_t noiseLfsr = 0x4000;
     int      noiseCounter = 0;
 
+    // ── Echo (basic delay+feedback, no FIR yet) ─────────────────────────
+    // ESA*0x100 = echo buffer start in ARAM; EDL*2KB = buffer length (0-15
+    // steps). Each buffer entry is 4 bytes: L then R, 16-bit LE PCM.
+    // TODO: real hardware runs the delayed sample through an 8-tap FIR
+    // filter (per-voice-row coeffs at regs[0x0F + voice*0x10]) before
+    // feedback/output; this pass uses the raw delayed sample instead.
+    uint32_t echoPos = 0; // sample index within the current buffer lap
+
     // KON/KOFF ($4C/$5C) are only sampled once every 2 output samples on
     // real hardware (SNESdev Errata, S-SMP section) — writes to those regs
     // just update the byte; actual key-on/key-off happens in mixSample()
@@ -124,7 +132,8 @@ uint16_t noiseLfsr = 0x4000;
     // (15-bit Fibonacci LFSR, taps at bit0/bit1) rather than a verified
     // hardware trace — produces correctly-shaped pseudorandom noise even
     // if the exact bit sequence doesn't match real silicon cycle-for-cycle.
-    void tickNoise();
+void tickNoise();
+    void tickEcho(int32_t inL, int32_t inR, int32_t& outL, int32_t& outR);
 
     // Converts the current 15-bit LFSR value to a signed 16-bit sample,
     // same scale as a decoded BRR sample, so it can substitute for `cur`

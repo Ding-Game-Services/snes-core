@@ -9,16 +9,18 @@ namespace ding::snes {
 namespace {
 // DSP register offsets (global, not per-voice)
 constexpr int kMVOLL = 0x0C, kMVOLR = 0x1C;
-constexpr int kEVOLL = 0x2C, kEVOLR = 0x3C; // echo — unused until Milestone B
+constexpr int kEVOLL = 0x2C, kEVOLR = 0x3C; // echo volume L/R
 constexpr int kKON   = 0x4C;
 constexpr int kKOFF  = 0x5C;
 constexpr int kFLG   = 0x6C;
 constexpr int kPMON  = 0x2D;
 constexpr int kNON   = 0x3D;
+constexpr int kEON   = 0x4D; // echo-enable per voice
 constexpr int kENDX  = 0x7C;
 constexpr int kDIR   = 0x5D;
-constexpr int kESA   = 0x6D; // echo start — unused until Milestone B
-constexpr int kEDL   = 0x7D; // echo delay — unused until Milestone B
+constexpr int kEFB   = 0x0D; // echo feedback (signed)
+constexpr int kESA   = 0x6D; // echo buffer start (ARAM addr = ESA<<8)
+constexpr int kEDL   = 0x7D; // echo delay, 0-15 -> buffer len = EDL*2KB
 
 // Per-voice register offsets, add voice*0x10
 constexpr int vVOLL = 0x00, vVOLR = 0x01, vPITCHL = 0x02, vPITCHH = 0x03;
@@ -266,6 +268,44 @@ int16_t DSP::noiseSample(uint16_t lfsr) {
     return clamp16(signed15 * 2);
 }
 
+void DSP::tickEcho(int32_t inL, int32_t inR, int32_t& outL, int32_t& outR) {
+    uint8_t flg = regs[kFLG];
+    uint32_t esa = static_cast<uint32_t>(regs[kESA]) << 8;
+    int edl = regs[kEDL] & 0xF;
+    // EDL=0 -> 1-sample minimum so the pointer still has a valid slot;
+    // real hardware gives a near-zero delay in this case.
+    uint32_t lenSamples = edl == 0 ? 1u : static_cast<uint32_t>(edl) * 512u;
+
+    if (echoPos >= lenSamples) echoPos = 0;
+    uint32_t addr = (esa + echoPos * 4u) & 0xFFFF;
+
+    int16_t readL = static_cast<int16_t>(rd(addr) | (rd((addr + 1) & 0xFFFF) << 8));
+    int16_t readR = static_cast<int16_t>(rd((addr + 2) & 0xFFFF) | (rd((addr + 3) & 0xFFFF) << 8));
+
+    // Output: echo volume scales the delayed (pre-feedback) sample.
+    int8_t evolL = static_cast<int8_t>(regs[kEVOLL]);
+    int8_t evolR = static_cast<int8_t>(regs[kEVOLR]);
+    outL = (static_cast<int32_t>(readL) * evolL) >> 7;
+    outR = (static_cast<int32_t>(readR) * evolR) >> 7;
+
+    // Write: feedback-scaled delayed sample + this sample's EON-enabled
+    // voice input, unless FLG bit5 freezes the buffer (reads/output still
+    // happen, writes don't).
+    if (!(flg & 0x20)) {
+        int8_t efb = static_cast<int8_t>(regs[kEFB]);
+        int32_t fbL = (static_cast<int32_t>(readL) * efb) >> 7;
+        int32_t fbR = (static_cast<int32_t>(readR) * efb) >> 7;
+        int16_t newL = clamp16(inL + fbL);
+        int16_t newR = clamp16(inR + fbR);
+        aram[addr]               = static_cast<uint8_t>(newL & 0xFF);
+        aram[(addr + 1) & 0xFFFF] = static_cast<uint8_t>((newL >> 8) & 0xFF);
+        aram[(addr + 2) & 0xFFFF] = static_cast<uint8_t>(newR & 0xFF);
+        aram[(addr + 3) & 0xFFFF] = static_cast<uint8_t>((newR >> 8) & 0xFF);
+    }
+
+    echoPos++;
+}
+
 void DSP::mixSample(float& outL, float& outR) {
     // KON/KOFF poll — every 2nd sample, matching real hardware. Applying
     // these instantly at write-time (old behavior) meant a driver writing
@@ -294,9 +334,10 @@ void DSP::mixSample(float& outL, float& outR) {
     // everything real SOFT RESET touches wasn't available to verify against.
     if (flg & 0x80) { outL = 0.0f; outR = 0.0f; return; }
 
-    tickNoise();
+ tickNoise();
 
     int32_t mixL = 0, mixR = 0;
+    int32_t echoInL = 0, echoInR = 0;
 
     // Previous voice's enveloped output (pre-VOL), used by PMON pitch
     // modulation for the *next* voice in processing order. A silent/inactive
@@ -323,10 +364,11 @@ void DSP::mixSample(float& outL, float& outR) {
         int8_t volL = static_cast<int8_t>(regs[base + vVOLL]);
         int8_t volR = static_cast<int8_t>(regs[base + vVOLR]);
 
-        int32_t sL = (enveloped * volL) >> 7;
+ int32_t sL = (enveloped * volL) >> 7;
         int32_t sR = (enveloped * volR) >> 7;
         mixL += sL;
         mixR += sR;
+        if (regs[kEON] & (1 << i)) { echoInL += sL; echoInR += sR; }
 
         regs[base + vOUTX] = static_cast<uint8_t>((enveloped >> 8) & 0xFF);
 
@@ -384,13 +426,19 @@ void DSP::mixSample(float& outL, float& outR) {
         prevVoiceOut = thisVoiceOut;
     }
 
-    int8_t mvolL = static_cast<int8_t>(regs[kMVOLL]);
+ int8_t mvolL = static_cast<int8_t>(regs[kMVOLL]);
     int8_t mvolR = static_cast<int8_t>(regs[kMVOLR]);
     mixL = (mixL * mvolL) >> 7;
     mixR = (mixR * mvolR) >> 7;
 
-outL = std::clamp(mixL, -32768, 32767) / 32768.0f;
-    outR = std::clamp(mixR, -32768, 32767) / 32768.0f;
+    int32_t echoOutL = 0, echoOutR = 0;
+    tickEcho(echoInL, echoInR, echoOutL, echoOutR);
+
+    int32_t finalL = std::clamp(std::clamp(mixL, -32768, 32767) + echoOutL, -32768, 32767);
+    int32_t finalR = std::clamp(std::clamp(mixR, -32768, 32767) + echoOutR, -32768, 32767);
+
+    outL = finalL / 32768.0f;
+    outR = finalR / 32768.0f;
 
     // FLG bit6: mute. Forces the DAC output to 0 without stopping voice
     // processing — envelopes/noise/BRR playback above all keep running so

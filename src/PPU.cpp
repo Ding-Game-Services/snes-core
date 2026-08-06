@@ -627,6 +627,7 @@ if (needWin && (tmWin & tmBit)) {
         }
 
 uint16_t subC15 = subBD;
+        bool subOpaque = false; // true once a real sub-screen layer pixel is found below
         if (addendIsSubscreen && cmEn) {
             for (auto& layer : layerList) {
                 int tsBit = layer.isSprite == 1 ? 0x10 : (1 << layer.idx);
@@ -639,13 +640,14 @@ if (needWin && (tsWin & tsBit)) {
                 if (layer.isSprite == 1) {
                     if (!haveSpr) continue;
                     const Px& sp = sprL[x];
-                    if (sp.valid && sp.prio == layer.prio) { subC15 = cgram[sp.cgi]; break; }
+                    if (sp.valid && sp.prio == layer.prio) { subC15 = cgram[sp.cgi]; subOpaque = true; break; }
                 } else {
                     int bg = layer.idx;
                     if (!haveBg[bg]) continue;
                     const Px& px = bgL[bg][x];
                     if (px.valid && px.prio == layer.prio) {
                         subC15 = isDirectLayer(bg) ? directColor(px.cgi, px.attr) : cgram[px.cgi];
+                        subOpaque = true;
                         break;
                     }
                 }
@@ -656,7 +658,7 @@ if (needWin && (tsWin & tsBit)) {
         // math operand back to backdrop within the selected region. Only
         // meaningful when Addend is actually the sub screen — fixed color
         // has no "layers" for this to mask.
-        if (addendIsSubscreen && regionActive(subTransSel, x)) subC15 = cgram[0];
+        if (addendIsSubscreen && regionActive(subTransSel, x)) { subC15 = cgram[0]; subOpaque = false; }
 
         uint16_t c15 = isDirectLayer(mainLayer) ? directColor(static_cast<uint8_t>(mainCGI), mainAttr) : cgram[mainCGI];
 
@@ -676,7 +678,15 @@ if (needWin && (tsWin & tsBit)) {
             int lbit = mainLayer == -1 ? 0x20 : mainLayer == 4 ? 0x10 : (1 << mainLayer);
             if (cmEn & lbit) doCM = true;
         }
-        if (doCM) c15 = blendC(c15, subC15, cmAdd ? 0 : 1, cmHalf);
+        if (doCM) {
+            // Per hardware: halving never applies when either operand pixel
+            // was actually transparent (backdrop/fixed-color fallback used),
+            // regardless of the CGADSUB half bit.
+            bool mainTransparent = (mainLayer == -1);
+            bool subTransparent  = addendIsSubscreen && !subOpaque;
+            bool effHalf = cmHalf && !mainTransparent && !subTransparent;
+            c15 = blendC(c15, subC15, cmAdd ? 0 : 1, effHalf);
+        }
 
         uint32_t rgba = toARGB(c15);
         if (brightness < 15) {

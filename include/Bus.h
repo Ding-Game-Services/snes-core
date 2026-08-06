@@ -27,8 +27,9 @@ struct DmaChannel {
     uint16_t tableAddr    = 0;
     uint8_t  tableBank    = 0;
     uint8_t  lineCounter  = 0;
-    uint16_t indirectAddr = 0;
+uint16_t indirectAddr = 0;
     bool     hdmaFinished = false;
+    bool     doTransfer   = false; // HDMA "Do Transfer" latch, see hdmaRun()
 };
 
 // Ring-buffer entry for APU port diagnostics (read via Bus::apuLog)
