@@ -296,8 +296,8 @@ void DSP::tickEcho(int32_t inL, int32_t inR, int32_t& outL, int32_t& outR) {
         firL += static_cast<int32_t>(echoHistL[idx]) * coef;
         firR += static_cast<int32_t>(echoHistR[idx]) * coef;
     }
-    int16_t filtL = clamp16(firL >> 6);
-    int16_t filtR = clamp16(firR >> 6);
+int16_t filtL = clamp16(firL >> 7);
+    int16_t filtR = clamp16(firR >> 7);
 
     // Output: echo volume scales the FIR-filtered sample.
     int8_t evolL = static_cast<int8_t>(regs[kEVOLL]);
