@@ -67,29 +67,29 @@ case 0x3E:
     }
 }
 
-void PPU::regWrite(uint16_t addr, uint8_t val) {
+void PPU::regWrite(uint16_t addr, uint8_t val, bool viaDMA) {
     int r = addr - 0x2100;
     if (r >= 0 && r < static_cast<int>(regs.size())) regs[r] = val;
     switch (r) {
         case 0x02: oamByteAddr = (((regs[0x03] & 1) << 8) | val) << 1; break;
         case 0x03: oamByteAddr = (((val & 1) << 8) | regs[0x02]) << 1; break;
 case 0x04:
-            if (oamByteAddr < 0x200) {
+ if (oamByteAddr < 0x200) {
                 if (oamByteAddr & 1) {
-                    if (oamVramAccessOk()) { oam[oamByteAddr ^ 1] = oamLow; oam[oamByteAddr] = val; }
+                    if (viaDMA || oamVramAccessOk()) { oam[oamByteAddr ^ 1] = oamLow; oam[oamByteAddr] = val; }
                 } else {
                     oamLow = val;
                 }
             } else if (oamByteAddr < 0x220) {
-                if (oamVramAccessOk()) oam[oamByteAddr] = val;
+                if (viaDMA || oamVramAccessOk()) oam[oamByteAddr] = val;
             }
             oamByteAddr = (oamByteAddr + 1) & 0x3FF;
             break;
-        case 0x0D: bgH[0] = ((val << 8) | (m7prev & 0xF8) | ((bgH[0] >> 8) & 0x07)) & 0x3FF; m7prev = val; break;
+        case 0x0D: bgH[0] = ((val << 8) | (m7prev & 0xF8) | (bgH[0] & 0x07)) & 0x3FF; m7prev = val; break;
 case 0x0E: bgV[0] = ((val << 8) | m7prev) & 0x3FF; m7prev = val; break;
-case 0x0F: bgH[1] = ((val << 8) | (bgPrev & 0xF8) | ((bgH[1] >> 8) & 0x07)) & 0x3FF; bgPrev = val; break;
+case 0x0F: bgH[1] = ((val << 8) | (bgPrev & 0xF8) | (bgH[1] & 0x07)) & 0x3FF; bgPrev = val; break;
 case 0x10: bgV[1] = ((val << 8) | bgPrev) & 0x3FF; bgPrev = val; break;
-case 0x11: bgH[2] = ((val << 8) | (bgPrev & 0xF8) | ((bgH[2] >> 8) & 0x07)) & 0x3FF; bgPrev = val; break;
+case 0x11: bgH[2] = ((val << 8) | (bgPrev & 0xF8) | (bgH[2] & 0x07)) & 0x3FF; bgPrev = val; break;
 case 0x12: bgV[2] = ((val << 8) | bgPrev) & 0x3FF; bgPrev = val; break;
 case 0x13: bgH[3] = ((val << 8) | (bgPrev & 0xF8) | ((bgH[3] >> 8) & 0x07)) & 0x3FF; bgPrev = val; break;
 case 0x14: bgV[3] = ((val << 8) | bgPrev) & 0x3FF; bgPrev = val; break;
@@ -101,12 +101,12 @@ case 0x14: bgV[3] = ((val << 8) | bgPrev) & 0x3FF; bgPrev = val; break;
         }
         case 0x16: vramAddr = (vramAddr & 0x7F00) | val; prefetchVRAM(); break;
         case 0x17: vramAddr = (vramAddr & 0x00FF) | ((val & 0x7F) << 8); prefetchVRAM(); break;
-case 0x18:
-            if (oamVramAccessOk()) vram[(vramAddr << 1) & 0xFFFF] = val;
+ case 0x18:
+            if (viaDMA || oamVramAccessOk()) vram[(vramAddr << 1) & 0xFFFF] = val;
             if (!vramIncOnHi) { vramAddr = (vramAddr + vramInc) & 0x7FFF; prefetchVRAM(); }
             break;
         case 0x19:
-            if (oamVramAccessOk()) vram[((vramAddr << 1) + 1) & 0xFFFF] = val;
+            if (viaDMA || oamVramAccessOk()) vram[((vramAddr << 1) + 1) & 0xFFFF] = val;
             if (vramIncOnHi) { vramAddr = (vramAddr + vramInc) & 0x7FFF; prefetchVRAM(); }
             break;
         case 0x1B: m7a = (val << 8) | m7prev; m7prev = val; break;
@@ -118,8 +118,8 @@ case 0x18:
         case 0x21: cgramAddr = val; cgramLatch = false; break;
 case 0x22:
             if (!cgramLatch) { cgramBuf = val; cgramLatch = true; }
-            else {
-                if (cgramAccessOk())
+ else {
+                if (viaDMA || cgramAccessOk())
                     cgram[cgramAddr & 0xFF] = ((val & 0x7F) << 8) | cgramBuf;
                 cgramAddr = (cgramAddr + 1) & 0xFF;
                 cgramLatch = false;

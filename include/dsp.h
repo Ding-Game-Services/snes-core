@@ -93,10 +93,17 @@ uint16_t noiseLfsr = 0x4000;
     // ── Echo (basic delay+feedback, no FIR yet) ─────────────────────────
     // ESA*0x100 = echo buffer start in ARAM; EDL*2KB = buffer length (0-15
     // steps). Each buffer entry is 4 bytes: L then R, 16-bit LE PCM.
-    // TODO: real hardware runs the delayed sample through an 8-tap FIR
-    // filter (per-voice-row coeffs at regs[0x0F + voice*0x10]) before
-    // feedback/output; this pass uses the raw delayed sample instead.
+ // Real hardware runs the delayed sample through an 8-tap FIR filter
+    // (coeffs at regs[0x0F], regs[0x1F], ... regs[0x7F]) before
+    // feedback/output — see echoHistL/echoHistR and tickEcho() in dsp.cpp.
     uint32_t echoPos = 0; // sample index within the current buffer lap
+
+    // Rolling history of the last 8 raw (pre-feedback) echo-buffer reads,
+    // one per channel — this is what the 8-tap FIR filter (COEF regs,
+    // $0F/$1F/.../$7F) actually filters across. echoHistPos indexes the
+    // most recently written slot; taps walk backward from there.
+    int16_t echoHistL[8] = {}, echoHistR[8] = {};
+    int     echoHistPos = 0;
 
     // KON/KOFF ($4C/$5C) are only sampled once every 2 output samples on
     // real hardware (SNESdev Errata, S-SMP section) — writes to those regs

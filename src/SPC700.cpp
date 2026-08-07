@@ -457,8 +457,8 @@ case 0x6E: {
         }
         case 0xAA: { uint16_t ab = abs_(); C = (rd(ab >> 3) >> (ab & 7)) & 1; cy = 4; break; }
         case 0xCA: { uint16_t ab = abs_(); int b = ab & 7; uint16_t a = ab >> 3; wr(a, C ? (rd(a) | (1 << b)) : (rd(a) & ~(1 << b))); cy = 6; break; }
-        case 0x6A: { uint16_t ab = abs_(); C = C & ((rd(ab >> 3) >> (ab & 7)) & 1); cy = 4; break; }
-        case 0x4A: { uint16_t ab = abs_(); C = C & (1 ^ ((rd(ab >> 3) >> (ab & 7)) & 1)); cy = 4; break; }
+case 0x6A: { uint16_t ab = abs_(); C = C & (1 ^ ((rd(ab >> 3) >> (ab & 7)) & 1)); cy = 4; break; }
+        case 0x4A: { uint16_t ab = abs_(); C = C & ((rd(ab >> 3) >> (ab & 7)) & 1); cy = 4; break; }
         case 0x0A: { uint16_t ab = abs_(); C = C | ((rd(ab >> 3) >> (ab & 7)) & 1); cy = 4; break; }
         case 0x2A: { uint16_t ab = abs_(); C = C | (1 ^ ((rd(ab >> 3) >> (ab & 7)) & 1)); cy = 4; break; }
         case 0x8A: { uint16_t ab = abs_(); C = C ^ ((rd(ab >> 3) >> (ab & 7)) & 1); cy = 4; break; }
@@ -467,7 +467,7 @@ case 0x0E: { uint16_t a = abs_(); uint8_t v = rd(a); sNZ(A & v); wr(a, v | A); c
 case 0x4E: { uint16_t a = abs_(); uint8_t v = rd(a); sNZ(A & v); wr(a, v & ~A); cy = 6; break; }
         case 0x60: C = 0; cy = 2; break;
         case 0x80: C = 1; cy = 2; break;
-        case 0xED: C ^= 1; cy = 2; break;
+        case 0xED: C ^= 1; cy = 3; break;
         case 0xE0: V = 0; H = 0; cy = 2; break;
         case 0x20: P = 0; cy = 2; break;
         case 0x40: P = 1; cy = 2; break;
@@ -480,8 +480,8 @@ case 0x4E: { uint16_t a = abs_(); uint8_t v = rd(a); sNZ(A & v); wr(a, v & ~A); 
             PC = (rd(0xFFDF) << 8) | rd(0xFFDE);
             cy = 8; break;
         }
-        case 0xFF: cy = 2; break;
-        case 0xEF: cy = 2; break;
+        case 0xFF: cy = 3; break;
+        case 0xEF: cy = 3; break;
         default:   cy = 2; break;
     }
 

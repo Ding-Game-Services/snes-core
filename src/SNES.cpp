@@ -129,15 +129,16 @@ while (spcAcc >= 1.0) {
         // clearing it here just keeps the flag meaningful for the next read.
         bus.spcSyncRequested = false;
 
-        ppuDone = ppu.advance(mc);
+ ppuDone = ppu.advance(mc);
 
 int sl = ppu.scanline;
         if (sl != lastScanline) {
             if (lastScanline < kScreenH && bus.hdmaen) bus.hdmaRun();
-            bus.checkIRQ(lastScanline);
             lastScanline = sl;
             refreshDone = false;
+            bus.hIrqFiredThisLine = false;
         }
+        bus.checkIRQ(sl, static_cast<int>(ppu.clk));
     }
 }
 

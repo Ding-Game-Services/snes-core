@@ -46,8 +46,8 @@ class Bus {
 public:
     explicit Bus(Cartridge& cart);
 
-    uint8_t read(uint32_t addr24);
-    void    write(uint32_t addr24, uint8_t val);
+uint8_t read(uint32_t addr24);
+    void    write(uint32_t addr24, uint8_t val, bool viaDMA = false);
 
     // Called by PPU at start of VBlank to raise NMI if enabled
     void triggerNMI();
@@ -56,8 +56,11 @@ public:
     void hdmaInit();
     void hdmaRun();
 
-    // Called once per scanline transition from SNES::runFrame
-    void checkIRQ(int scanline);
+ // H/V timer IRQ — called every CPU step (not just once per scanline)
+    // so H-IRQ (mode 1) and H+V-IRQ (mode 3) can fire near the correct
+    // dot instead of only at the start of the line. lineClk is the PPU's
+    // current master-clock position within the active scanline.
+    void checkIRQ(int scanline, int lineClk);
 
     // Wiring (set by SNES after construction)
     PPU*      ppu = nullptr;
@@ -94,6 +97,15 @@ public:
 
 uint8_t openBus = 0;
 
+// Diagnostics: how many times triggerNMI() has fired (once per vblank
+    // entry, always, per hardware), vs how many times the CPU has actually
+    // acknowledged it by reading $4210. If fireCount keeps climbing every
+    // frame but ackCount doesn't, the CPU is never taking the interrupt —
+    // points at CPU65816::step()'s pendingNMI check. If both climb but the
+    // game still hangs, the vector/handler itself is the problem instead.
+    uint32_t nmiFireCount = 0;
+    uint32_t nmiAckCount  = 0;
+
     // Set by internalRead when a $2140-2143 poll repeats the last-seen value
     // (i.e. the CPU is spin-waiting on the APU, e.g. IPL handshake). SNES::
     // runFrame checks this to prioritize draining the SPC clock debt right
@@ -101,14 +113,19 @@ uint8_t openBus = 0;
     // scheduling nudge — never advances the SPC beyond what spcAcc allows.
     bool spcSyncRequested = false;
 
-    // Serial joypad latch ($4016 strobe, $4016/$4017 serial reads).
+ // Serial joypad latch ($4016 strobe, $4016/$4017 serial reads).
     // Public so save-state serialization can reach it directly.
     bool    joyStrobe = false;
     uint8_t joyBit1 = 0, joyBit2 = 0;
 
+    // H-IRQ (mode 1/3) fires once per scanline at ~HTIME's dot; this
+    // latches so repeated checkIRQ calls within the same line (now called
+    // every CPU step) don't refire it every step once past the threshold.
+    bool hIrqFiredThisLine = false;
+
 private:
     uint8_t internalRead(uint8_t bank, uint16_t addr);
-    void    internalWrite(uint8_t bank, uint16_t addr, uint8_t val);
+    void    internalWrite(uint8_t bank, uint16_t addr, uint8_t val, bool viaDMA = false);
     uint8_t internalRegRead(uint16_t addr);   // $4200–$44FF reads
     void    internalRegWrite(uint16_t addr, uint8_t val); // $4200–$44FF writes
     uint8_t wramPortRead();

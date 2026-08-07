@@ -282,19 +282,36 @@ void DSP::tickEcho(int32_t inL, int32_t inR, int32_t& outL, int32_t& outR) {
     int16_t readL = static_cast<int16_t>(rd(addr) | (rd((addr + 1) & 0xFFFF) << 8));
     int16_t readR = static_cast<int16_t>(rd((addr + 2) & 0xFFFF) | (rd((addr + 3) & 0xFFFF) << 8));
 
-    // Output: echo volume scales the delayed (pre-feedback) sample.
+    // 8-tap FIR: push this sample's raw (pre-feedback) buffer read into the
+    // rolling history, then filter across the last 8 reads. COEF0 weights
+    // the newest sample, COEF7 the sample from 7 echo-steps back.
+    echoHistPos = (echoHistPos + 1) & 7;
+    echoHistL[echoHistPos] = readL;
+    echoHistR[echoHistPos] = readR;
+
+    int32_t firL = 0, firR = 0;
+    for (int k = 0; k < 8; k++) {
+        int8_t coef = static_cast<int8_t>(regs[0x0F + k * 0x10]);
+        int idx = (echoHistPos - k) & 7;
+        firL += static_cast<int32_t>(echoHistL[idx]) * coef;
+        firR += static_cast<int32_t>(echoHistR[idx]) * coef;
+    }
+    int16_t filtL = clamp16(firL >> 6);
+    int16_t filtR = clamp16(firR >> 6);
+
+    // Output: echo volume scales the FIR-filtered sample.
     int8_t evolL = static_cast<int8_t>(regs[kEVOLL]);
     int8_t evolR = static_cast<int8_t>(regs[kEVOLR]);
-    outL = (static_cast<int32_t>(readL) * evolL) >> 7;
-    outR = (static_cast<int32_t>(readR) * evolR) >> 7;
+    outL = (static_cast<int32_t>(filtL) * evolL) >> 7;
+    outR = (static_cast<int32_t>(filtR) * evolR) >> 7;
 
-    // Write: feedback-scaled delayed sample + this sample's EON-enabled
-    // voice input, unless FLG bit5 freezes the buffer (reads/output still
+    // Write: feedback-scaled FIR output + this sample's EON-enabled voice
+    // input, unless FLG bit5 freezes the buffer (reads/output still
     // happen, writes don't).
     if (!(flg & 0x20)) {
         int8_t efb = static_cast<int8_t>(regs[kEFB]);
-        int32_t fbL = (static_cast<int32_t>(readL) * efb) >> 7;
-        int32_t fbR = (static_cast<int32_t>(readR) * efb) >> 7;
+        int32_t fbL = (static_cast<int32_t>(filtL) * efb) >> 7;
+        int32_t fbR = (static_cast<int32_t>(filtR) * efb) >> 7;
         int16_t newL = clamp16(inL + fbL);
         int16_t newR = clamp16(inR + fbR);
         aram[addr]               = static_cast<uint8_t>(newL & 0xFF);

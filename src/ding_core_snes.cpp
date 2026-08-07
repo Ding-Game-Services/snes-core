@@ -527,12 +527,14 @@ size_t ding_diag_cpu_state(char* buf, size_t buf_size) {
 size_t ding_diag_video_state(char* buf, size_t buf_size) {
     if (!buf || buf_size == 0 || !g_snes) return 0;
     const PPU& p = g_snes->ppu;
+  const Bus& bx = g_snes->bus;
     int n = std::snprintf(buf, buf_size,
         "scanline=%d frame=%u vblank=%d mode=%d tm=%02X ts=%02X inidisp=%02X | "
-        "scrollH=%d,%d,%d,%d scrollV=%d,%d,%d,%d",
+        "scrollH=%d,%d,%d,%d scrollV=%d,%d,%d,%d | nmitimen=%02X nmiFlag=%02X nmiFireCount=%u nmiAckCount=%u",
         p.scanline, p.frame, p.vblank ? 1 : 0, p.regs[0x05] & 7, p.regs[0x2C], p.regs[0x2D], p.regs[0x00],
         p.bgH[0], p.bgH[1], p.bgH[2], p.bgH[3],
-        p.bgV[0], p.bgV[1], p.bgV[2], p.bgV[3]);
+        p.bgV[0], p.bgV[1], p.bgV[2], p.bgV[3],
+        bx.nmitimen, bx.nmiFlag, bx.nmiFireCount, bx.nmiAckCount);
     return n < 0 ? 0 : static_cast<size_t>(n);
 }
 

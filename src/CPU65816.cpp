@@ -64,14 +64,14 @@ uint32_t CPU65816::amDP()  { uint8_t d = f8(); return (DP + d) & 0xFFFF; }
 uint32_t CPU65816::amDPX() { uint8_t d = f8(); return (DP + d + X) & 0xFFFF; }
 uint32_t CPU65816::amDPY() { uint8_t d = f8(); return (DP + d + Y) & 0xFFFF; }
 uint32_t CPU65816::amAbs() { return (static_cast<uint32_t>(DBR) << 16) | f16(); }
-uint32_t CPU65816::amAbX() { return (static_cast<uint32_t>(DBR) << 16) | ((f16() + X) & 0xFFFF); }
-uint32_t CPU65816::amAbY() { return (static_cast<uint32_t>(DBR) << 16) | ((f16() + Y) & 0xFFFF); }
+uint32_t CPU65816::amAbX() { uint16_t base = f16(); uint16_t ea = (base + X) & 0xFFFF; _pageCrossed = (base & 0xFF00) != (ea & 0xFF00); return (static_cast<uint32_t>(DBR) << 16) | ea; }
+uint32_t CPU65816::amAbY() { uint16_t base = f16(); uint16_t ea = (base + Y) & 0xFFFF; _pageCrossed = (base & 0xFF00) != (ea & 0xFF00); return (static_cast<uint32_t>(DBR) << 16) | ea; }
 uint32_t CPU65816::amLng() { return f24(); }
 uint32_t CPU65816::amLnX() { return (f24() + X) & 0xFFFFFF; }
 uint32_t CPU65816::amSR()  { uint8_t o = f8(); return (SP + o) & 0xFFFF; }
 uint32_t CPU65816::amDPI()  { uint32_t ea = amDP(); return (static_cast<uint32_t>(DBR) << 16) | r16(0, static_cast<uint16_t>(ea)); }
 uint32_t CPU65816::amDPIX() { uint8_t d = f8(); uint16_t ptr = (DP + d + X) & 0xFFFF; return (static_cast<uint32_t>(DBR) << 16) | r16(0, ptr); }
-uint32_t CPU65816::amDPIY() { uint32_t ea = amDP(); return (static_cast<uint32_t>(DBR) << 16) | ((r16(0, static_cast<uint16_t>(ea)) + Y) & 0xFFFF); }
+uint32_t CPU65816::amDPIY() { uint32_t ea = amDP(); uint16_t base = r16(0, static_cast<uint16_t>(ea)); uint16_t addr = (base + Y) & 0xFFFF; _pageCrossed = (base & 0xFF00) != (addr & 0xFF00); return (static_cast<uint32_t>(DBR) << 16) | addr; }
 uint32_t CPU65816::amDPIL() { uint32_t ea = amDP(); return r24(0, static_cast<uint16_t>(ea)); }
 uint32_t CPU65816::amDPILY(){ uint32_t ea = amDP(); return (r24(0, static_cast<uint16_t>(ea)) + Y) & 0xFFFFFF; }
 uint32_t CPU65816::amSRIY() { uint16_t ptr = (SP + f8()) & 0xFFFF; return (static_cast<uint32_t>(DBR) << 16) | ((r16(0, ptr) + Y) & 0xFFFF); }
@@ -218,8 +218,26 @@ int CPU65816::step() {
         if (!pendingNMI && !pendingIRQ && !nmiSignal) return 2;
         waiting = false;
     }
-    if (pendingNMI) { doNMI(); return 8; }
-    if (pendingIRQ && !fI()) { doIRQ(); return 8; }
+if (pendingNMI) {
+        doNMI();
+        int32_t traceKey = (static_cast<int32_t>(PBR) << 16) | PC;
+        if (traceKey != _lastTracedPC) {
+            _lastTracedPC = traceKey;
+            pcTrace.push_back({PBR, PC, 0xFF}); // 0xFF = synthetic "NMI entry" marker, not a real opcode
+            if (pcTrace.size() > 24) pcTrace.erase(pcTrace.begin());
+        }
+        return 8;
+    }
+    if (pendingIRQ && !fI()) {
+        doIRQ();
+        int32_t traceKey = (static_cast<int32_t>(PBR) << 16) | PC;
+        if (traceKey != _lastTracedPC) {
+            _lastTracedPC = traceKey;
+            pcTrace.push_back({PBR, PC, 0xFE}); // 0xFE = synthetic "IRQ entry" marker
+            if (pcTrace.size() > 24) pcTrace.erase(pcTrace.begin());
+        }
+        return 8;
+    }
 
     uint8_t op = f8();
     int32_t traceKey = (static_cast<int32_t>(PBR) << 16) | ((PC - 1) & 0xFFFF);
@@ -232,54 +250,54 @@ int CPU65816::step() {
 
     switch (op) {
         case 0xA9: { auto v = rdM(amImmM()); A = fM() ? (A & 0xFF00) | (v & 0xFF) : (v & 0xFFFF); nzM(A); cy = fM() ? 2 : 3; break; }
-        case 0xA5: { auto v = rdM(amDP());  A = fM() ? (A & 0xFF00) | (v & 0xFF) : (v & 0xFFFF); nzM(A); cy = 3; break; }
-        case 0xB5: { auto v = rdM(amDPX()); A = fM() ? (A & 0xFF00) | (v & 0xFF) : (v & 0xFFFF); nzM(A); cy = 4; break; }
-        case 0xAD: { auto v = rdM(amAbs()); A = fM() ? (A & 0xFF00) | (v & 0xFF) : (v & 0xFFFF); nzM(A); cy = 4; break; }
-        case 0xBD: { auto v = rdM(amAbX()); A = fM() ? (A & 0xFF00) | (v & 0xFF) : (v & 0xFFFF); nzM(A); cy = 4; break; }
-        case 0xB9: { auto v = rdM(amAbY()); A = fM() ? (A & 0xFF00) | (v & 0xFF) : (v & 0xFFFF); nzM(A); cy = 4; break; }
-        case 0xAF: { auto v = rdM(amLng()); A = fM() ? (A & 0xFF00) | (v & 0xFF) : (v & 0xFFFF); nzM(A); cy = 5; break; }
-        case 0xBF: { auto v = rdM(amLnX()); A = fM() ? (A & 0xFF00) | (v & 0xFF) : (v & 0xFFFF); nzM(A); cy = 5; break; }
-        case 0xA1: { auto v = rdM(amDPIX()); A = fM() ? (A & 0xFF00) | (v & 0xFF) : (v & 0xFFFF); nzM(A); cy = 6; break; }
-        case 0xB1: { auto v = rdM(amDPIY()); A = fM() ? (A & 0xFF00) | (v & 0xFF) : (v & 0xFFFF); nzM(A); cy = 5; break; }
-        case 0xB2: { auto v = rdM(amDPI());  A = fM() ? (A & 0xFF00) | (v & 0xFF) : (v & 0xFFFF); nzM(A); cy = 5; break; }
-        case 0xA7: { auto v = rdM(amDPIL()); A = fM() ? (A & 0xFF00) | (v & 0xFF) : (v & 0xFFFF); nzM(A); cy = 6; break; }
-        case 0xB7: { auto v = rdM(amDPILY()); A = fM() ? (A & 0xFF00) | (v & 0xFF) : (v & 0xFFFF); nzM(A); cy = 6; break; }
-        case 0xA3: { auto v = rdM(amSR());   A = fM() ? (A & 0xFF00) | (v & 0xFF) : (v & 0xFFFF); nzM(A); cy = 4; break; }
-        case 0xB3: { auto v = rdM(amSRIY()); A = fM() ? (A & 0xFF00) | (v & 0xFF) : (v & 0xFFFF); nzM(A); cy = 7; break; }
+ case 0xA5: { auto v = rdM(amDP());  A = fM() ? (A & 0xFF00) | (v & 0xFF) : (v & 0xFFFF); nzM(A); cy = fM() ? 3 : 4; break; }
+        case 0xB5: { auto v = rdM(amDPX()); A = fM() ? (A & 0xFF00) | (v & 0xFF) : (v & 0xFFFF); nzM(A); cy = fM() ? 4 : 5; break; }
+        case 0xAD: { auto v = rdM(amAbs()); A = fM() ? (A & 0xFF00) | (v & 0xFF) : (v & 0xFFFF); nzM(A); cy = fM() ? 4 : 5; break; }
+        case 0xBD: { auto v = rdM(amAbX()); A = fM() ? (A & 0xFF00) | (v & 0xFF) : (v & 0xFFFF); nzM(A); cy = (fM() ? 4 : 5) + ((!fX() || _pageCrossed) ? 1 : 0); break; }
+        case 0xB9: { auto v = rdM(amAbY()); A = fM() ? (A & 0xFF00) | (v & 0xFF) : (v & 0xFFFF); nzM(A); cy = (fM() ? 4 : 5) + ((!fX() || _pageCrossed) ? 1 : 0); break; }
+        case 0xAF: { auto v = rdM(amLng()); A = fM() ? (A & 0xFF00) | (v & 0xFF) : (v & 0xFFFF); nzM(A); cy = fM() ? 5 : 6; break; }
+        case 0xBF: { auto v = rdM(amLnX()); A = fM() ? (A & 0xFF00) | (v & 0xFF) : (v & 0xFFFF); nzM(A); cy = fM() ? 5 : 6; break; }
+        case 0xA1: { auto v = rdM(amDPIX()); A = fM() ? (A & 0xFF00) | (v & 0xFF) : (v & 0xFFFF); nzM(A); cy = fM() ? 6 : 7; break; }
+        case 0xB1: { auto v = rdM(amDPIY()); A = fM() ? (A & 0xFF00) | (v & 0xFF) : (v & 0xFFFF); nzM(A); cy = (fM() ? 5 : 6) + ((!fX() || _pageCrossed) ? 1 : 0); break; }
+        case 0xB2: { auto v = rdM(amDPI());  A = fM() ? (A & 0xFF00) | (v & 0xFF) : (v & 0xFFFF); nzM(A); cy = fM() ? 5 : 6; break; }
+        case 0xA7: { auto v = rdM(amDPIL()); A = fM() ? (A & 0xFF00) | (v & 0xFF) : (v & 0xFFFF); nzM(A); cy = fM() ? 6 : 7; break; }
+        case 0xB7: { auto v = rdM(amDPILY()); A = fM() ? (A & 0xFF00) | (v & 0xFF) : (v & 0xFFFF); nzM(A); cy = fM() ? 6 : 7; break; }
+        case 0xA3: { auto v = rdM(amSR());   A = fM() ? (A & 0xFF00) | (v & 0xFF) : (v & 0xFFFF); nzM(A); cy = fM() ? 4 : 5; break; }
+        case 0xB3: { auto v = rdM(amSRIY()); A = fM() ? (A & 0xFF00) | (v & 0xFF) : (v & 0xFFFF); nzM(A); cy = fM() ? 7 : 8; break; }
         case 0xA2: { X = rdX(amImmX()); nzX(X); cy = fX() ? 2 : 3; break; }
-        case 0xA6: { X = rdX(amDP());  nzX(X); cy = 3; break; }
-        case 0xB6: { X = rdX(amDPY()); nzX(X); cy = 4; break; }
-        case 0xAE: { X = rdX(amAbs()); nzX(X); cy = 4; break; }
-        case 0xBE: { X = rdX(amAbY()); nzX(X); cy = 4; break; }
+case 0xA6: { X = rdX(amDP());  nzX(X); cy = fX() ? 3 : 4; break; }
+case 0xB6: { X = rdX(amDPY()); nzX(X); cy = fX() ? 4 : 5; break; }
+        case 0xAE: { X = rdX(amAbs()); nzX(X); cy = fX() ? 4 : 5; break; }
+       case 0xBE: { X = rdX(amAbY()); nzX(X); cy = (fX() ? 4 : 5) + (fX() && _pageCrossed ? 1 : 0); break; } 
         case 0xA0: { Y = rdX(amImmX()); nzX(Y); cy = fX() ? 2 : 3; break; }
-        case 0xA4: { Y = rdX(amDP());  nzX(Y); cy = 3; break; }
-        case 0xB4: { Y = rdX(amDPX()); nzX(Y); cy = 4; break; }
-        case 0xAC: { Y = rdX(amAbs()); nzX(Y); cy = 4; break; }
-        case 0xBC: { Y = rdX(amAbX()); nzX(Y); cy = 4; break; }
-        case 0x85: wrM(amDP(),  A); cy = 3; break;
-        case 0x95: wrM(amDPX(), A); cy = 4; break;
-        case 0x8D: wrM(amAbs(), A); cy = 4; break;
-        case 0x9D: wrM(amAbX(), A); cy = 5; break;
-        case 0x99: wrM(amAbY(), A); cy = 5; break;
-        case 0x8F: wrM(amLng(), A); cy = 5; break;
-        case 0x9F: wrM(amLnX(), A); cy = 5; break;
-        case 0x81: wrM(amDPIX(), A); cy = 6; break;
-        case 0x91: wrM(amDPIY(), A); cy = 6; break;
-        case 0x92: wrM(amDPI(),  A); cy = 5; break;
-        case 0x87: wrM(amDPIL(), A); cy = 6; break;
-        case 0x97: wrM(amDPILY(),A); cy = 6; break;
-        case 0x83: wrM(amSR(),   A); cy = 4; break;
-        case 0x93: wrM(amSRIY(), A); cy = 7; break;
-        case 0x86: wrX(amDP(),  X); cy = 3; break;
-        case 0x96: wrX(amDPY(), X); cy = 4; break;
-        case 0x8E: wrX(amAbs(), X); cy = 4; break;
-        case 0x84: wrX(amDP(),  Y); cy = 3; break;
-        case 0x94: wrX(amDPX(), Y); cy = 4; break;
-        case 0x8C: wrX(amAbs(), Y); cy = 4; break;
-        case 0x64: wrM(amDP(),  0); cy = 3; break;
-        case 0x74: wrM(amDPX(), 0); cy = 4; break;
-        case 0x9C: wrM(amAbs(), 0); cy = 4; break;
-        case 0x9E: wrM(amAbX(), 0); cy = 5; break;
+case 0xA4: { Y = rdX(amDP());  nzX(Y); cy = fX() ? 3 : 4; break; }
+ case 0xB4: { Y = rdX(amDPX()); nzX(Y); cy = fX() ? 4 : 5; break; }
+        case 0xAC: { Y = rdX(amAbs()); nzX(Y); cy = fX() ? 4 : 5; break; }
+        case 0xBC: { Y = rdX(amAbX()); nzX(Y); cy = (fX() ? 4 : 5) + (fX() && _pageCrossed ? 1 : 0); break; }
+        case 0x85: wrM(amDP(),  A); cy = fM() ? 3 : 4; break;
+        case 0x95: wrM(amDPX(), A); cy = fM() ? 4 : 5; break;
+        case 0x8D: wrM(amAbs(), A); cy = fM() ? 4 : 5; break;
+        case 0x9D: wrM(amAbX(), A); cy = fM() ? 5 : 6; break;
+        case 0x99: wrM(amAbY(), A); cy = fM() ? 5 : 6; break;
+        case 0x8F: wrM(amLng(), A); cy = fM() ? 5 : 6; break;
+        case 0x9F: wrM(amLnX(), A); cy = fM() ? 5 : 6; break;
+        case 0x81: wrM(amDPIX(), A); cy = fM() ? 6 : 7; break;
+        case 0x91: wrM(amDPIY(), A); cy = fM() ? 6 : 7; break;
+        case 0x92: wrM(amDPI(),  A); cy = fM() ? 5 : 6; break;
+        case 0x87: wrM(amDPIL(), A); cy = fM() ? 6 : 7; break;
+        case 0x97: wrM(amDPILY(),A); cy = fM() ? 6 : 7; break;
+        case 0x83: wrM(amSR(),   A); cy = fM() ? 4 : 5; break;
+        case 0x93: wrM(amSRIY(), A); cy = fM() ? 7 : 8; break;
+case 0x86: wrX(amDP(),  X); cy = fX() ? 3 : 4; break;
+        case 0x96: wrX(amDPY(), X); cy = fX() ? 4 : 5; break;
+        case 0x8E: wrX(amAbs(), X); cy = fX() ? 4 : 5; break;
+        case 0x84: wrX(amDP(),  Y); cy = fX() ? 3 : 4; break;
+        case 0x94: wrX(amDPX(), Y); cy = fX() ? 4 : 5; break;
+        case 0x8C: wrX(amAbs(), Y); cy = fX() ? 4 : 5; break;
+case 0x64: wrM(amDP(),  0); cy = fM() ? 3 : 4; break;
+        case 0x74: wrM(amDPX(), 0); cy = fM() ? 4 : 5; break;
+        case 0x9C: wrM(amAbs(), 0); cy = fM() ? 4 : 5; break;
+        case 0x9E: wrM(amAbX(), 0); cy = fM() ? 5 : 6; break;
         case 0xAA: X = fX() ? (A & 0xFF) : (A & 0xFFFF); nzX(X); break;
         case 0xA8: Y = fX() ? (A & 0xFF) : (A & 0xFFFF); nzX(Y); break;
         case 0x8A: A = fM() ? (A & 0xFF00) | (X & 0xFF) : (X & 0xFFFF); nzM(A); break;
@@ -292,9 +310,9 @@ int CPU65816::step() {
         case 0x7B: A = DP; nz16(A); break;
         case 0x1B: SP = E ? (0x100 | (A & 0xFF)) : (A & 0xFFFF); break;
         case 0x3B: A = SP; nz16(A); break;
-        case 0x48: fM() ? ph8(A & 0xFF) : ph16(A); cy = 3; break;
-        case 0xDA: fX() ? ph8(X & 0xFF) : ph16(X); cy = 3; break;
-        case 0x5A: fX() ? ph8(Y & 0xFF) : ph16(Y); cy = 3; break;
+        case 0x48: fM() ? ph8(A & 0xFF) : ph16(A); cy = fM() ? 3 : 4; break;
+case 0xDA: fX() ? ph8(X & 0xFF) : ph16(X); cy = fX() ? 3 : 4; break;
+        case 0x5A: fX() ? ph8(Y & 0xFF) : ph16(Y); cy = fX() ? 3 : 4; break;
         case 0x08: ph8(E ? (P | 0x30) : P); cy = 3; break;
         case 0x8B: ph8(DBR); cy = 3; break;
         case 0x0B: ph16(DP); cy = 4; break;
@@ -302,100 +320,100 @@ int CPU65816::step() {
         case 0xF4: ph16(f16()); cy = 5; break;
         case 0xD4: ph16(r16(0, static_cast<uint16_t>(amDP()))); cy = 6; break;
         case 0x62: { uint16_t o = f16(); ph16((PC + (o < 0x8000 ? o : o - 0x10000)) & 0xFFFF); cy = 6; break; }
-        case 0x68: { auto v = fM() ? pl8() : pl16(); A = fM() ? (A & 0xFF00) | (v & 0xFF) : (v & 0xFFFF); nzM(A); cy = 4; break; }
-        case 0xFA: { X = fX() ? pl8() : pl16(); nzX(X); cy = 4; break; }
-        case 0x7A: { Y = fX() ? pl8() : pl16(); nzX(Y); cy = 4; break; }
+        case 0x68: { auto v = fM() ? pl8() : pl16(); A = fM() ? (A & 0xFF00) | (v & 0xFF) : (v & 0xFFFF); nzM(A); cy = fM() ? 4 : 5; break; }
+case 0xFA: { X = fX() ? pl8() : pl16(); nzX(X); cy = fX() ? 4 : 5; break; }
+        case 0x7A: { Y = fX() ? pl8() : pl16(); nzX(Y); cy = fX() ? 4 : 5; break; }
         case 0x28: { P = pl8(); if (E) P |= 0x30; if (fX()) { X &= 0xFF; Y &= 0xFF; } cy = 4; break; }
         case 0xAB: { DBR = pl8(); nz8(DBR); cy = 4; break; }
         case 0x2B: { DP = pl16(); nz16(DP); cy = 5; break; }
         case 0x69: adc(rdM(amImmM())); cy = fM() ? 2 : 3; break;
-        case 0x65: adc(rdM(amDP()));   cy = 3; break;
-        case 0x75: adc(rdM(amDPX()));  cy = 4; break;
-        case 0x6D: adc(rdM(amAbs()));  cy = 4; break;
-        case 0x7D: adc(rdM(amAbX()));  cy = 4; break;
-        case 0x79: adc(rdM(amAbY()));  cy = 4; break;
-        case 0x6F: adc(rdM(amLng()));  cy = 5; break;
-        case 0x7F: adc(rdM(amLnX()));  cy = 5; break;
-        case 0x61: adc(rdM(amDPIX())); cy = 6; break;
-        case 0x71: adc(rdM(amDPIY())); cy = 5; break;
-        case 0x72: adc(rdM(amDPI()));  cy = 5; break;
-        case 0x67: adc(rdM(amDPIL())); cy = 6; break;
-        case 0x77: adc(rdM(amDPILY()));cy = 6; break;
-        case 0x63: adc(rdM(amSR()));   cy = 4; break;
-        case 0x73: adc(rdM(amSRIY())); cy = 7; break;
+ case 0x65: adc(rdM(amDP()));   cy = fM() ? 3 : 4; break;
+        case 0x75: adc(rdM(amDPX()));  cy = fM() ? 4 : 5; break;
+        case 0x6D: adc(rdM(amAbs()));  cy = fM() ? 4 : 5; break;
+        case 0x7D: adc(rdM(amAbX()));  cy = (fM() ? 4 : 5) + ((!fX() || _pageCrossed) ? 1 : 0); break;
+        case 0x79: adc(rdM(amAbY()));  cy = (fM() ? 4 : 5) + ((!fX() || _pageCrossed) ? 1 : 0); break;
+        case 0x6F: adc(rdM(amLng()));  cy = fM() ? 5 : 6; break;
+        case 0x7F: adc(rdM(amLnX()));  cy = fM() ? 5 : 6; break;
+case 0x61: adc(rdM(amDPIX())); cy = fM() ? 6 : 7; break;
+        case 0x71: adc(rdM(amDPIY())); cy = (fM() ? 5 : 6) + ((!fX() || _pageCrossed) ? 1 : 0); break;
+        case 0x72: adc(rdM(amDPI()));  cy = fM() ? 5 : 6; break;
+        case 0x67: adc(rdM(amDPIL())); cy = fM() ? 6 : 7; break;
+        case 0x77: adc(rdM(amDPILY()));cy = fM() ? 6 : 7; break;
+        case 0x63: adc(rdM(amSR()));   cy = fM() ? 4 : 5; break;
+        case 0x73: adc(rdM(amSRIY())); cy = fM() ? 7 : 8; break;
         case 0xE9: sbc(rdM(amImmM())); cy = fM() ? 2 : 3; break;
-        case 0xE5: sbc(rdM(amDP()));   cy = 3; break;
-        case 0xF5: sbc(rdM(amDPX()));  cy = 4; break;
-        case 0xED: sbc(rdM(amAbs()));  cy = 4; break;
-        case 0xFD: sbc(rdM(amAbX()));  cy = 4; break;
-        case 0xF9: sbc(rdM(amAbY()));  cy = 4; break;
-        case 0xEF: sbc(rdM(amLng()));  cy = 5; break;
-        case 0xFF: sbc(rdM(amLnX()));  cy = 5; break;
-        case 0xE1: sbc(rdM(amDPIX())); cy = 6; break;
-        case 0xF1: sbc(rdM(amDPIY())); cy = 5; break;
-        case 0xF2: sbc(rdM(amDPI()));  cy = 5; break;
-        case 0xE7: sbc(rdM(amDPIL())); cy = 6; break;
-        case 0xF7: sbc(rdM(amDPILY()));cy = 6; break;
-        case 0xE3: sbc(rdM(amSR()));   cy = 4; break;
-        case 0xF3: sbc(rdM(amSRIY())); cy = 7; break;
+case 0xE5: sbc(rdM(amDP()));   cy = fM() ? 3 : 4; break;
+        case 0xF5: sbc(rdM(amDPX()));  cy = fM() ? 4 : 5; break;
+        case 0xED: sbc(rdM(amAbs()));  cy = fM() ? 4 : 5; break;
+        case 0xFD: sbc(rdM(amAbX()));  cy = (fM() ? 4 : 5) + ((!fX() || _pageCrossed) ? 1 : 0); break;
+        case 0xF9: sbc(rdM(amAbY()));  cy = (fM() ? 4 : 5) + ((!fX() || _pageCrossed) ? 1 : 0); break;
+        case 0xEF: sbc(rdM(amLng()));  cy = fM() ? 5 : 6; break;
+        case 0xFF: sbc(rdM(amLnX()));  cy = fM() ? 5 : 6; break;
+case 0xE1: sbc(rdM(amDPIX())); cy = fM() ? 6 : 7; break;
+        case 0xF1: sbc(rdM(amDPIY())); cy = (fM() ? 5 : 6) + ((!fX() || _pageCrossed) ? 1 : 0); break;
+        case 0xF2: sbc(rdM(amDPI()));  cy = fM() ? 5 : 6; break;
+        case 0xE7: sbc(rdM(amDPIL())); cy = fM() ? 6 : 7; break;
+        case 0xF7: sbc(rdM(amDPILY()));cy = fM() ? 6 : 7; break;
+        case 0xE3: sbc(rdM(amSR()));   cy = fM() ? 4 : 5; break;
+        case 0xF3: sbc(rdM(amSRIY())); cy = fM() ? 7 : 8; break;
 
         case 0xC9: { auto v = rdM(amImmM()); cy = fM() ? 2 : 3;
             if (fM()) { int32_t r = (A & 0xFF) - (v & 0xFF); sN(r & 0x80); sZ((r & 0xFF) == 0); sC(r >= 0); }
             else { int32_t r = (A & 0xFFFF) - (v & 0xFFFF); sN(r & 0x8000); sZ((r & 0xFFFF) == 0); sC(r >= 0); }
             break; }
-        case 0xC5: { auto v = rdM(amDP()); cy = 3;
+        case 0xC5: { auto v = rdM(amDP()); cy = fM() ? 3 : 4;
             if (fM()) { int32_t r = (A & 0xFF) - (v & 0xFF); sN(r & 0x80); sZ((r & 0xFF) == 0); sC(r >= 0); }
             else { int32_t r = (A & 0xFFFF) - (v & 0xFFFF); sN(r & 0x8000); sZ((r & 0xFFFF) == 0); sC(r >= 0); }
             break; }
-        case 0xD5: { auto v = rdM(amDPX()); cy = 4;
+        case 0xD5: { auto v = rdM(amDPX()); cy = fM() ? 4 : 5;
             if (fM()) { int32_t r = (A & 0xFF) - (v & 0xFF); sN(r & 0x80); sZ((r & 0xFF) == 0); sC(r >= 0); }
             else { int32_t r = (A & 0xFFFF) - (v & 0xFFFF); sN(r & 0x8000); sZ((r & 0xFFFF) == 0); sC(r >= 0); }
             break; }
-        case 0xCD: { auto v = rdM(amAbs()); cy = 4;
+        case 0xCD: { auto v = rdM(amAbs()); cy = fM() ? 4 : 5;
             if (fM()) { int32_t r = (A & 0xFF) - (v & 0xFF); sN(r & 0x80); sZ((r & 0xFF) == 0); sC(r >= 0); }
             else { int32_t r = (A & 0xFFFF) - (v & 0xFFFF); sN(r & 0x8000); sZ((r & 0xFFFF) == 0); sC(r >= 0); }
             break; }
-        case 0xDD: { auto v = rdM(amAbX()); cy = 4;
+        case 0xDD: { auto v = rdM(amAbX()); cy = (fM() ? 4 : 5) + ((!fX() || _pageCrossed) ? 1 : 0);
             if (fM()) { int32_t r = (A & 0xFF) - (v & 0xFF); sN(r & 0x80); sZ((r & 0xFF) == 0); sC(r >= 0); }
             else { int32_t r = (A & 0xFFFF) - (v & 0xFFFF); sN(r & 0x8000); sZ((r & 0xFFFF) == 0); sC(r >= 0); }
             break; }
-        case 0xD9: { auto v = rdM(amAbY()); cy = 4;
+        case 0xD9: { auto v = rdM(amAbY()); cy = (fM() ? 4 : 5) + ((!fX() || _pageCrossed) ? 1 : 0);
             if (fM()) { int32_t r = (A & 0xFF) - (v & 0xFF); sN(r & 0x80); sZ((r & 0xFF) == 0); sC(r >= 0); }
             else { int32_t r = (A & 0xFFFF) - (v & 0xFFFF); sN(r & 0x8000); sZ((r & 0xFFFF) == 0); sC(r >= 0); }
             break; }
-        case 0xCF: { auto v = rdM(amLng()); cy = 5;
+        case 0xCF: { auto v = rdM(amLng()); cy = fM() ? 5 : 6;
             if (fM()) { int32_t r = (A & 0xFF) - (v & 0xFF); sN(r & 0x80); sZ((r & 0xFF) == 0); sC(r >= 0); }
             else { int32_t r = (A & 0xFFFF) - (v & 0xFFFF); sN(r & 0x8000); sZ((r & 0xFFFF) == 0); sC(r >= 0); }
             break; }
-        case 0xDF: { auto v = rdM(amLnX()); cy = 5;
+        case 0xDF: { auto v = rdM(amLnX()); cy = fM() ? 5 : 6;
             if (fM()) { int32_t r = (A & 0xFF) - (v & 0xFF); sN(r & 0x80); sZ((r & 0xFF) == 0); sC(r >= 0); }
             else { int32_t r = (A & 0xFFFF) - (v & 0xFFFF); sN(r & 0x8000); sZ((r & 0xFFFF) == 0); sC(r >= 0); }
             break; }
-        case 0xC1: { auto v = rdM(amDPIX()); cy = 6;
+        case 0xC1: { auto v = rdM(amDPIX()); cy = fM() ? 6 : 7;
             if (fM()) { int32_t r = (A & 0xFF) - (v & 0xFF); sN(r & 0x80); sZ((r & 0xFF) == 0); sC(r >= 0); }
             else { int32_t r = (A & 0xFFFF) - (v & 0xFFFF); sN(r & 0x8000); sZ((r & 0xFFFF) == 0); sC(r >= 0); }
             break; }
-        case 0xD1: { auto v = rdM(amDPIY()); cy = 5;
+        case 0xD1: { auto v = rdM(amDPIY()); cy = (fM() ? 5 : 6) + ((!fX() || _pageCrossed) ? 1 : 0);
             if (fM()) { int32_t r = (A & 0xFF) - (v & 0xFF); sN(r & 0x80); sZ((r & 0xFF) == 0); sC(r >= 0); }
             else { int32_t r = (A & 0xFFFF) - (v & 0xFFFF); sN(r & 0x8000); sZ((r & 0xFFFF) == 0); sC(r >= 0); }
             break; }
-        case 0xD2: { auto v = rdM(amDPI()); cy = 5;
+        case 0xD2: { auto v = rdM(amDPI()); cy = fM() ? 5 : 6;
             if (fM()) { int32_t r = (A & 0xFF) - (v & 0xFF); sN(r & 0x80); sZ((r & 0xFF) == 0); sC(r >= 0); }
             else { int32_t r = (A & 0xFFFF) - (v & 0xFFFF); sN(r & 0x8000); sZ((r & 0xFFFF) == 0); sC(r >= 0); }
             break; }
-        case 0xC7: { auto v = rdM(amDPIL()); cy = 6;
+        case 0xC7: { auto v = rdM(amDPIL()); cy = fM() ? 6 : 7;
             if (fM()) { int32_t r = (A & 0xFF) - (v & 0xFF); sN(r & 0x80); sZ((r & 0xFF) == 0); sC(r >= 0); }
             else { int32_t r = (A & 0xFFFF) - (v & 0xFFFF); sN(r & 0x8000); sZ((r & 0xFFFF) == 0); sC(r >= 0); }
             break; }
-        case 0xD7: { auto v = rdM(amDPILY()); cy = 6;
+        case 0xD7: { auto v = rdM(amDPILY()); cy = fM() ? 6 : 7;
             if (fM()) { int32_t r = (A & 0xFF) - (v & 0xFF); sN(r & 0x80); sZ((r & 0xFF) == 0); sC(r >= 0); }
             else { int32_t r = (A & 0xFFFF) - (v & 0xFFFF); sN(r & 0x8000); sZ((r & 0xFFFF) == 0); sC(r >= 0); }
             break; }
-        case 0xC3: { auto v = rdM(amSR()); cy = 4;
+        case 0xC3: { auto v = rdM(amSR()); cy = fM() ? 4 : 5;
             if (fM()) { int32_t r = (A & 0xFF) - (v & 0xFF); sN(r & 0x80); sZ((r & 0xFF) == 0); sC(r >= 0); }
             else { int32_t r = (A & 0xFFFF) - (v & 0xFFFF); sN(r & 0x8000); sZ((r & 0xFFFF) == 0); sC(r >= 0); }
             break; }
-        case 0xD3: { auto v = rdM(amSRIY()); cy = 7;
+        case 0xD3: { auto v = rdM(amSRIY()); cy = fM() ? 7 : 8;
             if (fM()) { int32_t r = (A & 0xFF) - (v & 0xFF); sN(r & 0x80); sZ((r & 0xFF) == 0); sC(r >= 0); }
             else { int32_t r = (A & 0xFFFF) - (v & 0xFFFF); sN(r & 0x8000); sZ((r & 0xFFFF) == 0); sC(r >= 0); }
             break; }
@@ -404,11 +422,11 @@ int CPU65816::step() {
             if (fX()) { int32_t r = (X & 0xFF) - (v & 0xFF); sN(r & 0x80); sZ((r & 0xFF) == 0); sC(r >= 0); }
             else { int32_t r = (X & 0xFFFF) - (v & 0xFFFF); sN(r & 0x8000); sZ((r & 0xFFFF) == 0); sC(r >= 0); }
             break; }
-        case 0xE4: { auto v = rdX(amDP()); cy = 3;
+        case 0xE4: { auto v = rdX(amDP()); cy = fX() ? 3 : 4;
             if (fX()) { int32_t r = (X & 0xFF) - (v & 0xFF); sN(r & 0x80); sZ((r & 0xFF) == 0); sC(r >= 0); }
             else { int32_t r = (X & 0xFFFF) - (v & 0xFFFF); sN(r & 0x8000); sZ((r & 0xFFFF) == 0); sC(r >= 0); }
             break; }
-        case 0xEC: { auto v = rdX(amAbs()); cy = 4;
+        case 0xEC: { auto v = rdX(amAbs()); cy = fX() ? 4 : 5;
             if (fX()) { int32_t r = (X & 0xFF) - (v & 0xFF); sN(r & 0x80); sZ((r & 0xFF) == 0); sC(r >= 0); }
             else { int32_t r = (X & 0xFFFF) - (v & 0xFFFF); sN(r & 0x8000); sZ((r & 0xFFFF) == 0); sC(r >= 0); }
             break; }
@@ -416,72 +434,72 @@ int CPU65816::step() {
             if (fX()) { int32_t r = (Y & 0xFF) - (v & 0xFF); sN(r & 0x80); sZ((r & 0xFF) == 0); sC(r >= 0); }
             else { int32_t r = (Y & 0xFFFF) - (v & 0xFFFF); sN(r & 0x8000); sZ((r & 0xFFFF) == 0); sC(r >= 0); }
             break; }
-        case 0xC4: { auto v = rdX(amDP()); cy = 3;
+        case 0xC4: { auto v = rdX(amDP()); cy = fX() ? 3 : 4;
             if (fX()) { int32_t r = (Y & 0xFF) - (v & 0xFF); sN(r & 0x80); sZ((r & 0xFF) == 0); sC(r >= 0); }
             else { int32_t r = (Y & 0xFFFF) - (v & 0xFFFF); sN(r & 0x8000); sZ((r & 0xFFFF) == 0); sC(r >= 0); }
             break; }
-        case 0xCC: { auto v = rdX(amAbs()); cy = 4;
+        case 0xCC: { auto v = rdX(amAbs()); cy = fX() ? 4 : 5;
             if (fX()) { int32_t r = (Y & 0xFF) - (v & 0xFF); sN(r & 0x80); sZ((r & 0xFF) == 0); sC(r >= 0); }
             else { int32_t r = (Y & 0xFFFF) - (v & 0xFFFF); sN(r & 0x8000); sZ((r & 0xFFFF) == 0); sC(r >= 0); }
             break; }
 
         case 0x29: { auto v = rdM(amImmM()); A = fM() ? (A & 0xFF00) | ((A & v) & 0xFF) : ((A & v) & 0xFFFF); nzM(A); cy = fM() ? 2 : 3; break; }
-        case 0x25: { auto v = rdM(amDP());  A = fM() ? (A & 0xFF00) | ((A & v) & 0xFF) : ((A & v) & 0xFFFF); nzM(A); cy = 3; break; }
-        case 0x35: { auto v = rdM(amDPX()); A = fM() ? (A & 0xFF00) | ((A & v) & 0xFF) : ((A & v) & 0xFFFF); nzM(A); cy = 4; break; }
-        case 0x2D: { auto v = rdM(amAbs()); A = fM() ? (A & 0xFF00) | ((A & v) & 0xFF) : ((A & v) & 0xFFFF); nzM(A); cy = 4; break; }
-        case 0x3D: { auto v = rdM(amAbX()); A = fM() ? (A & 0xFF00) | ((A & v) & 0xFF) : ((A & v) & 0xFFFF); nzM(A); cy = 4; break; }
-        case 0x39: { auto v = rdM(amAbY()); A = fM() ? (A & 0xFF00) | ((A & v) & 0xFF) : ((A & v) & 0xFFFF); nzM(A); cy = 4; break; }
-        case 0x2F: { auto v = rdM(amLng()); A = fM() ? (A & 0xFF00) | ((A & v) & 0xFF) : ((A & v) & 0xFFFF); nzM(A); cy = 5; break; }
-        case 0x3F: { auto v = rdM(amLnX()); A = fM() ? (A & 0xFF00) | ((A & v) & 0xFF) : ((A & v) & 0xFFFF); nzM(A); cy = 5; break; }
-        case 0x21: { auto v = rdM(amDPIX());A = fM() ? (A & 0xFF00) | ((A & v) & 0xFF) : ((A & v) & 0xFFFF); nzM(A); cy = 6; break; }
-        case 0x31: { auto v = rdM(amDPIY());A = fM() ? (A & 0xFF00) | ((A & v) & 0xFF) : ((A & v) & 0xFFFF); nzM(A); cy = 5; break; }
-        case 0x32: { auto v = rdM(amDPI()); A = fM() ? (A & 0xFF00) | ((A & v) & 0xFF) : ((A & v) & 0xFFFF); nzM(A); cy = 5; break; }
-        case 0x27: { auto v = rdM(amDPIL());A = fM() ? (A & 0xFF00) | ((A & v) & 0xFF) : ((A & v) & 0xFFFF); nzM(A); cy = 6; break; }
-        case 0x37: { auto v = rdM(amDPILY());A= fM() ? (A & 0xFF00) | ((A & v) & 0xFF) : ((A & v) & 0xFFFF); nzM(A); cy = 6; break; }
-        case 0x23: { auto v = rdM(amSR());  A = fM() ? (A & 0xFF00) | ((A & v) & 0xFF) : ((A & v) & 0xFFFF); nzM(A); cy = 4; break; }
-        case 0x33: { auto v = rdM(amSRIY());A = fM() ? (A & 0xFF00) | ((A & v) & 0xFF) : ((A & v) & 0xFFFF); nzM(A); cy = 7; break; }
+ case 0x25: { auto v = rdM(amDP());  A = fM() ? (A & 0xFF00) | ((A & v) & 0xFF) : ((A & v) & 0xFFFF); nzM(A); cy = fM() ? 3 : 4; break; }
+        case 0x35: { auto v = rdM(amDPX()); A = fM() ? (A & 0xFF00) | ((A & v) & 0xFF) : ((A & v) & 0xFFFF); nzM(A); cy = fM() ? 4 : 5; break; }
+        case 0x2D: { auto v = rdM(amAbs()); A = fM() ? (A & 0xFF00) | ((A & v) & 0xFF) : ((A & v) & 0xFFFF); nzM(A); cy = fM() ? 4 : 5; break; }
+        case 0x3D: { auto v = rdM(amAbX()); A = fM() ? (A & 0xFF00) | ((A & v) & 0xFF) : ((A & v) & 0xFFFF); nzM(A); cy = (fM() ? 4 : 5) + ((!fX() || _pageCrossed) ? 1 : 0); break; }
+        case 0x39: { auto v = rdM(amAbY()); A = fM() ? (A & 0xFF00) | ((A & v) & 0xFF) : ((A & v) & 0xFFFF); nzM(A); cy = (fM() ? 4 : 5) + ((!fX() || _pageCrossed) ? 1 : 0); break; }
+        case 0x2F: { auto v = rdM(amLng()); A = fM() ? (A & 0xFF00) | ((A & v) & 0xFF) : ((A & v) & 0xFFFF); nzM(A); cy = fM() ? 5 : 6; break; }
+        case 0x3F: { auto v = rdM(amLnX()); A = fM() ? (A & 0xFF00) | ((A & v) & 0xFF) : ((A & v) & 0xFFFF); nzM(A); cy = fM() ? 5 : 6; break; }
+case 0x21: { auto v = rdM(amDPIX());A = fM() ? (A & 0xFF00) | ((A & v) & 0xFF) : ((A & v) & 0xFFFF); nzM(A); cy = fM() ? 6 : 7; break; }
+        case 0x31: { auto v = rdM(amDPIY());A = fM() ? (A & 0xFF00) | ((A & v) & 0xFF) : ((A & v) & 0xFFFF); nzM(A); cy = (fM() ? 5 : 6) + ((!fX() || _pageCrossed) ? 1 : 0); break; }
+        case 0x32: { auto v = rdM(amDPI()); A = fM() ? (A & 0xFF00) | ((A & v) & 0xFF) : ((A & v) & 0xFFFF); nzM(A); cy = fM() ? 5 : 6; break; }
+        case 0x27: { auto v = rdM(amDPIL());A = fM() ? (A & 0xFF00) | ((A & v) & 0xFF) : ((A & v) & 0xFFFF); nzM(A); cy = fM() ? 6 : 7; break; }
+        case 0x37: { auto v = rdM(amDPILY());A= fM() ? (A & 0xFF00) | ((A & v) & 0xFF) : ((A & v) & 0xFFFF); nzM(A); cy = fM() ? 6 : 7; break; }
+        case 0x23: { auto v = rdM(amSR());  A = fM() ? (A & 0xFF00) | ((A & v) & 0xFF) : ((A & v) & 0xFFFF); nzM(A); cy = fM() ? 4 : 5; break; }
+        case 0x33: { auto v = rdM(amSRIY());A = fM() ? (A & 0xFF00) | ((A & v) & 0xFF) : ((A & v) & 0xFFFF); nzM(A); cy = fM() ? 7 : 8; break; }
 
         case 0x09: { auto v = rdM(amImmM()); A = fM() ? (A & 0xFF00) | ((A | v) & 0xFF) : ((A | v) & 0xFFFF); nzM(A); cy = fM() ? 2 : 3; break; }
-        case 0x05: { auto v = rdM(amDP());  A = fM() ? (A & 0xFF00) | ((A | v) & 0xFF) : ((A | v) & 0xFFFF); nzM(A); cy = 3; break; }
-        case 0x15: { auto v = rdM(amDPX()); A = fM() ? (A & 0xFF00) | ((A | v) & 0xFF) : ((A | v) & 0xFFFF); nzM(A); cy = 4; break; }
-        case 0x0D: { auto v = rdM(amAbs()); A = fM() ? (A & 0xFF00) | ((A | v) & 0xFF) : ((A | v) & 0xFFFF); nzM(A); cy = 4; break; }
-        case 0x1D: { auto v = rdM(amAbX()); A = fM() ? (A & 0xFF00) | ((A | v) & 0xFF) : ((A | v) & 0xFFFF); nzM(A); cy = 4; break; }
-        case 0x19: { auto v = rdM(amAbY()); A = fM() ? (A & 0xFF00) | ((A | v) & 0xFF) : ((A | v) & 0xFFFF); nzM(A); cy = 4; break; }
-        case 0x0F: { auto v = rdM(amLng()); A = fM() ? (A & 0xFF00) | ((A | v) & 0xFF) : ((A | v) & 0xFFFF); nzM(A); cy = 5; break; }
-        case 0x1F: { auto v = rdM(amLnX()); A = fM() ? (A & 0xFF00) | ((A | v) & 0xFF) : ((A | v) & 0xFFFF); nzM(A); cy = 5; break; }
-        case 0x01: { auto v = rdM(amDPIX());A = fM() ? (A & 0xFF00) | ((A | v) & 0xFF) : ((A | v) & 0xFFFF); nzM(A); cy = 6; break; }
-        case 0x11: { auto v = rdM(amDPIY());A = fM() ? (A & 0xFF00) | ((A | v) & 0xFF) : ((A | v) & 0xFFFF); nzM(A); cy = 5; break; }
-        case 0x12: { auto v = rdM(amDPI()); A = fM() ? (A & 0xFF00) | ((A | v) & 0xFF) : ((A | v) & 0xFFFF); nzM(A); cy = 5; break; }
-        case 0x07: { auto v = rdM(amDPIL());A = fM() ? (A & 0xFF00) | ((A | v) & 0xFF) : ((A | v) & 0xFFFF); nzM(A); cy = 6; break; }
-        case 0x17: { auto v = rdM(amDPILY());A= fM() ? (A & 0xFF00) | ((A | v) & 0xFF) : ((A | v) & 0xFFFF); nzM(A); cy = 6; break; }
-        case 0x03: { auto v = rdM(amSR());  A = fM() ? (A & 0xFF00) | ((A | v) & 0xFF) : ((A | v) & 0xFFFF); nzM(A); cy = 4; break; }
-        case 0x13: { auto v = rdM(amSRIY());A = fM() ? (A & 0xFF00) | ((A | v) & 0xFF) : ((A | v) & 0xFFFF); nzM(A); cy = 7; break; }
+case 0x05: { auto v = rdM(amDP());  A = fM() ? (A & 0xFF00) | ((A | v) & 0xFF) : ((A | v) & 0xFFFF); nzM(A); cy = fM() ? 3 : 4; break; }
+        case 0x15: { auto v = rdM(amDPX()); A = fM() ? (A & 0xFF00) | ((A | v) & 0xFF) : ((A | v) & 0xFFFF); nzM(A); cy = fM() ? 4 : 5; break; }
+        case 0x0D: { auto v = rdM(amAbs()); A = fM() ? (A & 0xFF00) | ((A | v) & 0xFF) : ((A | v) & 0xFFFF); nzM(A); cy = fM() ? 4 : 5; break; }
+        case 0x1D: { auto v = rdM(amAbX()); A = fM() ? (A & 0xFF00) | ((A | v) & 0xFF) : ((A | v) & 0xFFFF); nzM(A); cy = (fM() ? 4 : 5) + ((!fX() || _pageCrossed) ? 1 : 0); break; }
+        case 0x19: { auto v = rdM(amAbY()); A = fM() ? (A & 0xFF00) | ((A | v) & 0xFF) : ((A | v) & 0xFFFF); nzM(A); cy = (fM() ? 4 : 5) + ((!fX() || _pageCrossed) ? 1 : 0); break; }
+        case 0x0F: { auto v = rdM(amLng()); A = fM() ? (A & 0xFF00) | ((A | v) & 0xFF) : ((A | v) & 0xFFFF); nzM(A); cy = fM() ? 5 : 6; break; }
+        case 0x1F: { auto v = rdM(amLnX()); A = fM() ? (A & 0xFF00) | ((A | v) & 0xFF) : ((A | v) & 0xFFFF); nzM(A); cy = fM() ? 5 : 6; break; }
+case 0x01: { auto v = rdM(amDPIX());A = fM() ? (A & 0xFF00) | ((A | v) & 0xFF) : ((A | v) & 0xFFFF); nzM(A); cy = fM() ? 6 : 7; break; }
+        case 0x11: { auto v = rdM(amDPIY());A = fM() ? (A & 0xFF00) | ((A | v) & 0xFF) : ((A | v) & 0xFFFF); nzM(A); cy = (fM() ? 5 : 6) + ((!fX() || _pageCrossed) ? 1 : 0); break; }
+        case 0x12: { auto v = rdM(amDPI()); A = fM() ? (A & 0xFF00) | ((A | v) & 0xFF) : ((A | v) & 0xFFFF); nzM(A); cy = fM() ? 5 : 6; break; }
+        case 0x07: { auto v = rdM(amDPIL());A = fM() ? (A & 0xFF00) | ((A | v) & 0xFF) : ((A | v) & 0xFFFF); nzM(A); cy = fM() ? 6 : 7; break; }
+        case 0x17: { auto v = rdM(amDPILY());A= fM() ? (A & 0xFF00) | ((A | v) & 0xFF) : ((A | v) & 0xFFFF); nzM(A); cy = fM() ? 6 : 7; break; }
+        case 0x03: { auto v = rdM(amSR());  A = fM() ? (A & 0xFF00) | ((A | v) & 0xFF) : ((A | v) & 0xFFFF); nzM(A); cy = fM() ? 4 : 5; break; }
+        case 0x13: { auto v = rdM(amSRIY());A = fM() ? (A & 0xFF00) | ((A | v) & 0xFF) : ((A | v) & 0xFFFF); nzM(A); cy = fM() ? 7 : 8; break; }
 
-        case 0x49: { auto v = rdM(amImmM()); A = fM() ? (A & 0xFF00) | ((A ^ v) & 0xFF) : ((A ^ v) & 0xFFFF); nzM(A); cy = fM() ? 2 : 3; break; }
-        case 0x45: { auto v = rdM(amDP());  A = fM() ? (A & 0xFF00) | ((A ^ v) & 0xFF) : ((A ^ v) & 0xFFFF); nzM(A); cy = 3; break; }
-        case 0x55: { auto v = rdM(amDPX()); A = fM() ? (A & 0xFF00) | ((A ^ v) & 0xFF) : ((A ^ v) & 0xFFFF); nzM(A); cy = 4; break; }
-        case 0x4D: { auto v = rdM(amAbs()); A = fM() ? (A & 0xFF00) | ((A ^ v) & 0xFF) : ((A ^ v) & 0xFFFF); nzM(A); cy = 4; break; }
-        case 0x5D: { auto v = rdM(amAbX()); A = fM() ? (A & 0xFF00) | ((A ^ v) & 0xFF) : ((A ^ v) & 0xFFFF); nzM(A); cy = 4; break; }
-        case 0x59: { auto v = rdM(amAbY()); A = fM() ? (A & 0xFF00) | ((A ^ v) & 0xFF) : ((A ^ v) & 0xFFFF); nzM(A); cy = 4; break; }
-        case 0x4F: { auto v = rdM(amLng()); A = fM() ? (A & 0xFF00) | ((A ^ v) & 0xFF) : ((A ^ v) & 0xFFFF); nzM(A); cy = 5; break; }
-        case 0x5F: { auto v = rdM(amLnX()); A = fM() ? (A & 0xFF00) | ((A ^ v) & 0xFF) : ((A ^ v) & 0xFFFF); nzM(A); cy = 5; break; }
-        case 0x41: { auto v = rdM(amDPIX());A = fM() ? (A & 0xFF00) | ((A ^ v) & 0xFF) : ((A ^ v) & 0xFFFF); nzM(A); cy = 6; break; }
-        case 0x51: { auto v = rdM(amDPIY());A = fM() ? (A & 0xFF00) | ((A ^ v) & 0xFF) : ((A ^ v) & 0xFFFF); nzM(A); cy = 5; break; }
-        case 0x52: { auto v = rdM(amDPI()); A = fM() ? (A & 0xFF00) | ((A ^ v) & 0xFF) : ((A ^ v) & 0xFFFF); nzM(A); cy = 5; break; }
-        case 0x47: { auto v = rdM(amDPIL());A = fM() ? (A & 0xFF00) | ((A ^ v) & 0xFF) : ((A ^ v) & 0xFFFF); nzM(A); cy = 6; break; }
-        case 0x57: { auto v = rdM(amDPILY());A= fM() ? (A & 0xFF00) | ((A ^ v) & 0xFF) : ((A ^ v) & 0xFFFF); nzM(A); cy = 6; break; }
-        case 0x43: { auto v = rdM(amSR());  A = fM() ? (A & 0xFF00) | ((A ^ v) & 0xFF) : ((A ^ v) & 0xFFFF); nzM(A); cy = 4; break; }
-        case 0x53: { auto v = rdM(amSRIY());A = fM() ? (A & 0xFF00) | ((A ^ v) & 0xFF) : ((A ^ v) & 0xFFFF); nzM(A); cy = 7; break; }
+case 0x49: { auto v = rdM(amImmM()); A = fM() ? (A & 0xFF00) | ((A ^ v) & 0xFF) : ((A ^ v) & 0xFFFF); nzM(A); cy = fM() ? 2 : 3; break; }
+        case 0x45: { auto v = rdM(amDP());  A = fM() ? (A & 0xFF00) | ((A ^ v) & 0xFF) : ((A ^ v) & 0xFFFF); nzM(A); cy = fM() ? 3 : 4; break; }
+        case 0x55: { auto v = rdM(amDPX()); A = fM() ? (A & 0xFF00) | ((A ^ v) & 0xFF) : ((A ^ v) & 0xFFFF); nzM(A); cy = fM() ? 4 : 5; break; }
+        case 0x4D: { auto v = rdM(amAbs()); A = fM() ? (A & 0xFF00) | ((A ^ v) & 0xFF) : ((A ^ v) & 0xFFFF); nzM(A); cy = fM() ? 4 : 5; break; }
+        case 0x5D: { auto v = rdM(amAbX()); A = fM() ? (A & 0xFF00) | ((A ^ v) & 0xFF) : ((A ^ v) & 0xFFFF); nzM(A); cy = (fM() ? 4 : 5) + ((!fX() || _pageCrossed) ? 1 : 0); break; }
+        case 0x59: { auto v = rdM(amAbY()); A = fM() ? (A & 0xFF00) | ((A ^ v) & 0xFF) : ((A ^ v) & 0xFFFF); nzM(A); cy = (fM() ? 4 : 5) + ((!fX() || _pageCrossed) ? 1 : 0); break; }
+        case 0x4F: { auto v = rdM(amLng()); A = fM() ? (A & 0xFF00) | ((A ^ v) & 0xFF) : ((A ^ v) & 0xFFFF); nzM(A); cy = fM() ? 5 : 6; break; }
+        case 0x5F: { auto v = rdM(amLnX()); A = fM() ? (A & 0xFF00) | ((A ^ v) & 0xFF) : ((A ^ v) & 0xFFFF); nzM(A); cy = fM() ? 5 : 6; break; }
+case 0x41: { auto v = rdM(amDPIX());A = fM() ? (A & 0xFF00) | ((A ^ v) & 0xFF) : ((A ^ v) & 0xFFFF); nzM(A); cy = fM() ? 6 : 7; break; }
+        case 0x51: { auto v = rdM(amDPIY());A = fM() ? (A & 0xFF00) | ((A ^ v) & 0xFF) : ((A ^ v) & 0xFFFF); nzM(A); cy = (fM() ? 5 : 6) + ((!fX() || _pageCrossed) ? 1 : 0); break; }
+        case 0x52: { auto v = rdM(amDPI()); A = fM() ? (A & 0xFF00) | ((A ^ v) & 0xFF) : ((A ^ v) & 0xFFFF); nzM(A); cy = fM() ? 5 : 6; break; }
+        case 0x47: { auto v = rdM(amDPIL());A = fM() ? (A & 0xFF00) | ((A ^ v) & 0xFF) : ((A ^ v) & 0xFFFF); nzM(A); cy = fM() ? 6 : 7; break; }
+        case 0x57: { auto v = rdM(amDPILY());A= fM() ? (A & 0xFF00) | ((A ^ v) & 0xFF) : ((A ^ v) & 0xFFFF); nzM(A); cy = fM() ? 6 : 7; break; }
+        case 0x43: { auto v = rdM(amSR());  A = fM() ? (A & 0xFF00) | ((A ^ v) & 0xFF) : ((A ^ v) & 0xFFFF); nzM(A); cy = fM() ? 4 : 5; break; }
+        case 0x53: { auto v = rdM(amSRIY());A = fM() ? (A & 0xFF00) | ((A ^ v) & 0xFF) : ((A ^ v) & 0xFFFF); nzM(A); cy = fM() ? 7 : 8; break; }
 
         case 0x04: { uint32_t a = amDP();  auto v = rdM(a); sZ((A & v) == 0); wrM(a, v | (fM() ? (A & 0xFF) : A)); cy = 5; break; }
         case 0x0C: { uint32_t a = amAbs(); auto v = rdM(a); sZ((A & v) == 0); wrM(a, v | (fM() ? (A & 0xFF) : A)); cy = 6; break; }
         case 0x14: { uint32_t a = amDP();  auto v = rdM(a); sZ((A & v) == 0); wrM(a, (v & ~(fM() ? (A & 0xFF) : A)) & (fM() ? 0xFF : 0xFFFF)); cy = 5; break; }
         case 0x1C: { uint32_t a = amAbs(); auto v = rdM(a); sZ((A & v) == 0); wrM(a, (v & ~(fM() ? (A & 0xFF) : A)) & (fM() ? 0xFF : 0xFFFF)); cy = 6; break; }
         case 0x89: { auto v = rdM(amImmM()); sZ((A & v) == 0); cy = fM() ? 2 : 3; break; }
-        case 0x24: { auto v = rdM(amDP());  sN((v & (fM() ? 0x80 : 0x8000)) != 0); sV((v & (fM() ? 0x40 : 0x4000)) != 0); sZ((A & v) == 0); cy = 3; break; }
-        case 0x34: { auto v = rdM(amDPX()); sN((v & (fM() ? 0x80 : 0x8000)) != 0); sV((v & (fM() ? 0x40 : 0x4000)) != 0); sZ((A & v) == 0); cy = 4; break; }
-        case 0x2C: { auto v = rdM(amAbs()); sN((v & (fM() ? 0x80 : 0x8000)) != 0); sV((v & (fM() ? 0x40 : 0x4000)) != 0); sZ((A & v) == 0); cy = 4; break; }
-        case 0x3C: { auto v = rdM(amAbX()); sN((v & (fM() ? 0x80 : 0x8000)) != 0); sV((v & (fM() ? 0x40 : 0x4000)) != 0); sZ((A & v) == 0); cy = 4; break; }
+case 0x24: { auto v = rdM(amDP());  sN((v & (fM() ? 0x80 : 0x8000)) != 0); sV((v & (fM() ? 0x40 : 0x4000)) != 0); sZ((A & v) == 0); cy = fM() ? 3 : 4; break; }
+        case 0x34: { auto v = rdM(amDPX()); sN((v & (fM() ? 0x80 : 0x8000)) != 0); sV((v & (fM() ? 0x40 : 0x4000)) != 0); sZ((A & v) == 0); cy = fM() ? 4 : 5; break; }
+        case 0x2C: { auto v = rdM(amAbs()); sN((v & (fM() ? 0x80 : 0x8000)) != 0); sV((v & (fM() ? 0x40 : 0x4000)) != 0); sZ((A & v) == 0); cy = fM() ? 4 : 5; break; }
+        case 0x3C: { auto v = rdM(amAbX()); sN((v & (fM() ? 0x80 : 0x8000)) != 0); sV((v & (fM() ? 0x40 : 0x4000)) != 0); sZ((A & v) == 0); cy = fM() ? 4 : 5; break; }
 
         case 0x0A: asl_reg(); cy = 2; break;
         case 0x06: { uint32_t a = amDP();  asl_mem(a); cy = 5; break; }

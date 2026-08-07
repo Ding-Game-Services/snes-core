@@ -129,8 +129,9 @@ private:
     void doNMI();
     void doIRQ();
 
-    int _lastTracedPC = -1;
+int _lastTracedPC = -1;
     int _lastTracePc  = -1;
+    bool _pageCrossed = false; // set by amAbX/amAbY/amDPIY, consumed by footnote-3 opcodes
 
     Bus& bus;
 };

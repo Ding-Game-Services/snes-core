@@ -81,7 +81,7 @@ if (addr == 0x2180) return wramPortRead();
     return cart.read(bank, addr); // $6000-$FFFF: cart SRAM/ROM
 }
 
-void Bus::write(uint32_t addr24, uint8_t val) {
+void Bus::write(uint32_t addr24, uint8_t val, bool viaDMA) {
     uint8_t  bank = (addr24 >> 16) & 0xFF;
     uint16_t addr = addr24 & 0xFFFF;
     uint8_t  b    = bank & 0x7F;
@@ -92,15 +92,15 @@ void Bus::write(uint32_t addr24, uint8_t val) {
         return;
     }
     if (b <= 0x3F) {
-        internalWrite(bank, addr, val);
+        internalWrite(bank, addr, val, viaDMA);
         return;
     }
     cart.write(bank, addr, val);
 }
 
-void Bus::internalWrite(uint8_t bank, uint16_t addr, uint8_t val) {
+void Bus::internalWrite(uint8_t bank, uint16_t addr, uint8_t val, bool viaDMA) {
     if (addr <= 0x1FFF) { wram[addr & 0x1FFF] = val; return; }
-    if (addr <= 0x213F) { if (ppu) ppu->regWrite(addr, val); return; }
+    if (addr <= 0x213F) { if (ppu) ppu->regWrite(addr, val, viaDMA); return; }
     if (addr == 0x2180) { wramPortWrite(val); return; }
     if (addr == 0x2181) { wmaddr = (wmaddr & 0x1FF00) | val; return; }
     if (addr == 0x2182) { wmaddr = (wmaddr & 0x100FF) | (val << 8); return; }
@@ -139,7 +139,7 @@ void Bus::wramPortWrite(uint8_t val) {
 // ── Internal register reads ($4200–$44FF) ─────────────────────────────────
 uint8_t Bus::internalRegRead(uint16_t addr) {
     switch (addr) {
-        case 0x4210: { uint8_t v = nmiFlag | 0x02; nmiFlag = 0; return v; }
+        case 0x4210: { uint8_t v = nmiFlag | 0x02; nmiFlag = 0; nmiAckCount++; return v; }
         case 0x4211: { uint8_t v = irqFlag; irqFlag = 0; return v; }
         case 0x4212: {
     uint8_t vbl = (ppu && ppu->vblank) ? 0x80 : 0;
@@ -262,10 +262,10 @@ void Bus::runDMA() {
         while (count-- > 0) {
             uint16_t destAddr = static_cast<uint16_t>(0x2100 | c.destReg | pattern[pi % patLen]);
             pi++;
-            if (toWRAM) {
+ if (toWRAM) {
                 write(src, read(destAddr));
             } else {
-                write(destAddr, read(src));
+                write(destAddr, read(src), true);
             }
 if (!fixed) {
                 if (decr) src = (src & 0xFF0000) | ((src - 1) & 0xFFFF);
@@ -279,6 +279,7 @@ if (!fixed) {
 
 void Bus::triggerNMI() {
     nmiFlag = 0x80;
+    nmiFireCount++;
     if (nmitimen & 0x80) { if (cpu) cpu->pendingNMI = true; }
 }
 
@@ -335,7 +336,7 @@ const int* pattern = PATTERNS[c.ctrl & 7];
                     byte = read((c.tableBank << 16) | c.tableAddr);
                     c.tableAddr = (c.tableAddr + 1) & 0xFFFF;
                 }
-                write(dest, byte);
+                write(dest, byte, true);
             }
         }
 
@@ -365,13 +366,32 @@ const int* pattern = PATTERNS[c.ctrl & 7];
 }
 
 // ── H/V timer IRQ ─────────────────────────────────────────────────────────
-void Bus::checkIRQ(int scanline) {
+// Called every CPU step with the PPU's current master-clock position
+// within the active scanline, so H-IRQ (mode 1) and H+V-IRQ (mode 3) fire
+// near HTIME's actual dot instead of always at the start of the line.
+// HTIME is in dot units (0-339); ~4 master clocks per dot at NTSC timing.
+void Bus::checkIRQ(int scanline, int lineClk) {
     int mode = (nmitimen >> 4) & 3;
     if (!mode) return;
+
+    bool hReached = lineClk >= (htime * 4);
     bool fire = false;
-    if      (mode == 1) fire = true;
-    else if (mode == 2) fire = (scanline == vtime);
-    else if (mode == 3) fire = (scanline == vtime);
+
+    if (mode == 1) {
+        // H-IRQ: once per scanline, at HTIME's dot.
+        if (hReached && !hIrqFiredThisLine) { fire = true; hIrqFiredThisLine = true; }
+    } else if (mode == 2) {
+        // V-IRQ: once per frame, at VTIME's scanline, any H — fire as
+        // soon as we enter that scanline (matches old behavior).
+        fire = (scanline == vtime) && !hIrqFiredThisLine;
+        if (fire) hIrqFiredThisLine = true;
+    } else if (mode == 3) {
+        // H+V-IRQ: once per frame, at VTIME's scanline AND HTIME's dot.
+        if (scanline == vtime && hReached && !hIrqFiredThisLine) {
+            fire = true; hIrqFiredThisLine = true;
+        }
+    }
+
     if (fire) {
         irqFlag = 0x80;
         if (cpu) cpu->pendingIRQ = true;

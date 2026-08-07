@@ -21,8 +21,8 @@ class PPU {
 public:
     PPU();
 
-    uint8_t regRead(uint16_t addr);
-    void    regWrite(uint16_t addr, uint8_t val);
+uint8_t regRead(uint16_t addr);
+    void    regWrite(uint16_t addr, uint8_t val, bool viaDMA = false);
 
     // Advances the PPU by `masterClocks`; returns true when the frame is done.
     bool advance(int masterClocks);
