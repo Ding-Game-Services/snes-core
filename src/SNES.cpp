@@ -104,7 +104,12 @@ while (!ppuDone && guard++ < 750000) {
         // HDMA/raster splits against total line length. Approximated here
         // as a one-time stall the first time this line's clock position
         // crosses the halfway point of the 1364-clock line.
-        if (!refreshDone && (ppu.clk + static_cast<uint32_t>(mc) >= kLineMC / 2)) {
+// Real hardware stalls at cycle 538 of the first scanline, then at
+        // whichever multiple of 8 cycles thereafter lands closest to 536 —
+        // NOT at the halfway point of the line. The old kLineMC/2 (~682)
+        // put the stall ~144 cycles late, which can land it mid-HDMA-window
+        // instead of before it on games with tight raster/HDMA sync.
+        if (!refreshDone && (ppu.clk + static_cast<uint32_t>(mc) >= 538)) {
             mc += 40;
             refreshDone = true;
         }
@@ -129,7 +134,9 @@ while (spcAcc >= 1.0) {
         // clearing it here just keeps the flag meaningful for the next read.
         bus.spcSyncRequested = false;
 
- ppuDone = ppu.advance(mc);
+ppuDone = ppu.advance(mc);
+        bus.tickAutoJoy(mc);
+        bus.tickMulDiv(mc);
 
 int sl = ppu.scanline;
         if (sl != lastScanline) {

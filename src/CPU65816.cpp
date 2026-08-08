@@ -499,7 +499,7 @@ case 0x41: { auto v = rdM(amDPIX());A = fM() ? (A & 0xFF00) | ((A ^ v) & 0xFF) :
 case 0x24: { auto v = rdM(amDP());  sN((v & (fM() ? 0x80 : 0x8000)) != 0); sV((v & (fM() ? 0x40 : 0x4000)) != 0); sZ((A & v) == 0); cy = fM() ? 3 : 4; break; }
         case 0x34: { auto v = rdM(amDPX()); sN((v & (fM() ? 0x80 : 0x8000)) != 0); sV((v & (fM() ? 0x40 : 0x4000)) != 0); sZ((A & v) == 0); cy = fM() ? 4 : 5; break; }
         case 0x2C: { auto v = rdM(amAbs()); sN((v & (fM() ? 0x80 : 0x8000)) != 0); sV((v & (fM() ? 0x40 : 0x4000)) != 0); sZ((A & v) == 0); cy = fM() ? 4 : 5; break; }
-        case 0x3C: { auto v = rdM(amAbX()); sN((v & (fM() ? 0x80 : 0x8000)) != 0); sV((v & (fM() ? 0x40 : 0x4000)) != 0); sZ((A & v) == 0); cy = fM() ? 4 : 5; break; }
+        case 0x3C: { auto v = rdM(amAbX()); sN((v & (fM() ? 0x80 : 0x8000)) != 0); sV((v & (fM() ? 0x40 : 0x4000)) != 0); sZ((A & v) == 0); cy = (fM() ? 4 : 5) + ((!fX() || _pageCrossed) ? 1 : 0); break; }
 
         case 0x0A: asl_reg(); cy = 2; break;
         case 0x06: { uint32_t a = amDP();  asl_mem(a); cy = 5; break; }

@@ -87,6 +87,11 @@ void Bus::write(uint32_t addr24, uint8_t val, bool viaDMA) {
     uint8_t  b    = bank & 0x7F;
     val &= 0xFF;
 
+    // MDR (open bus) captures every memory read OR write, not just reads —
+    // see wiki.superfamicom.org/open-bus. Missing this meant open-bus reads
+    // right after a write still reflected the last-read value instead.
+    openBus = val;
+
     if (bank == 0x7E || bank == 0x7F) {
         wram[((bank - 0x7E) << 16) | addr] = val;
         return;
@@ -116,8 +121,11 @@ apuIn[n] = val;
         return;
     }
     if (addr >= 0x2144 && addr <= 0x217F) return;
-    if (addr == 0x4016) {
-        if (val & 1) { joyStrobe = true; joyBit1 = 0; joyBit2 = 0; }
+if (addr == 0x4016) {
+        if (val & 1) {
+            joyStrobe = true; joyBit1 = 0; joyBit2 = 0;
+            joypad[0] = rawJoypad[0]; joypad[1] = rawJoypad[1]; // latch at strobe, not at shift-out
+        }
         else           joyStrobe = false;
         return;
     }
@@ -141,10 +149,11 @@ uint8_t Bus::internalRegRead(uint16_t addr) {
     switch (addr) {
         case 0x4210: { uint8_t v = nmiFlag | 0x02; nmiFlag = 0; nmiAckCount++; return v; }
         case 0x4211: { uint8_t v = irqFlag; irqFlag = 0; return v; }
-        case 0x4212: {
+case 0x4212: {
     uint8_t vbl = (ppu && ppu->vblank) ? 0x80 : 0;
     uint8_t hbl = (ppu && ppu->hblank) ? 0x40 : 0;
-    return vbl | hbl;
+    uint8_t busy = autoJoyCountdown > 0 ? 0x01 : 0x00;
+    return vbl | hbl | busy;
 }
         case 0x4213: return wrio;
         case 0x4214: return divResult & 0xFF;
@@ -183,26 +192,39 @@ uint8_t Bus::internalRegRead(uint16_t addr) {
 void Bus::internalRegWrite(uint16_t addr, uint8_t val) {
     switch (addr) {
         case 0x4200: nmitimen = val; return;
-        case 0x4201: wrio     = val; return;
+        case 0x4201: {
+            // H/V latch also fires on a 1->0 transition of bit7 here (the
+            // other trigger, reading $2137 while bit7 is set, lives in
+            // PPU::regRead). Check the transition before overwriting wrio.
+            bool wasHigh = (wrio & 0x80) != 0;
+            wrio = val;
+            if (wasHigh && !(val & 0x80) && ppu) ppu->latchHV();
+            return;
+        }
         case 0x4202: wrmpya   = val; return;
-        case 0x4203:
-            wrmpyb    = val;
-            mpyResult = (wrmpya * wrmpyb) & 0xFFFF;
+case 0x4203:
+            wrmpyb = val;
+            // Real hardware also copies WRMPYB into the divide result
+            // register immediately (shared-circuit quirk) — kept instant;
+            // only the actual product is gated behind the real delay.
+            pendingResult = static_cast<uint16_t>((wrmpya * wrmpyb) & 0xFFFF);
+            pendingIsDiv = false;
+            mulDivCountdown = kMulCycles;
             divResult = wrmpyb;
             return;
         case 0x4204: wrdivl = val; return;
         case 0x4205: wrdivh = val; return;
-        case 0x4206: {
+case 0x4206: {
             wrdivb = val;
             uint16_t dividend = (wrdivh << 8) | wrdivl;
-            if (val == 0) {
-                divResult = 0xFFFF;
-                modResult = dividend;
-            } else {
-                divResult = dividend / val;
-                modResult = dividend % val;
-            }
-            mpyResult = modResult;
+            uint16_t q, r;
+            if (val == 0) { q = 0xFFFF; r = dividend; }
+            else          { q = dividend / val; r = dividend % val; }
+            pendingResult = q;
+            pendingMod    = r;
+            pendingIsDiv  = true;
+            mulDivCountdown = kDivCycles;
+            mpyResult = r; // shared-circuit quirk, same pattern as multiply's divResult side-effect
             return;
         }
         case 0x4207: htime = (htime & 0x100) | val; return;
@@ -281,6 +303,17 @@ void Bus::triggerNMI() {
     nmiFlag = 0x80;
     nmiFireCount++;
     if (nmitimen & 0x80) { if (cpu) cpu->pendingNMI = true; }
+
+    // Auto-joypad read: gated on nmitimen bit0 (independent of the NMI
+    // enable bit above), fires at the same vblank-start moment. Real
+    // hardware serially shifts both controllers in over ~4224 master
+    // clocks; we latch immediately and just hold $4212 bit0 busy for
+    // that long so games polling it before trusting $4218-421B behave.
+    if (nmitimen & 0x01) {
+        joypad[0] = rawJoypad[0];
+        joypad[1] = rawJoypad[1];
+        autoJoyCountdown = kAutoJoyCycles;
+    }
 }
 
 void Bus::hdmaInit() {

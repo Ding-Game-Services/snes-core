@@ -7,6 +7,7 @@
 // ─────────────────────────────────────────────────────────────────────────────
 #pragma once
 
+#include <algorithm>
 #include <array>
 #include <cstdint>
 #include <vector>
@@ -67,8 +68,21 @@ uint8_t read(uint32_t addr24);
     CPU65816* cpu = nullptr;
     SPC700*   spc = nullptr;
 
-    std::array<uint8_t, 0x20000> wram{}; // 128 KB
-    std::array<uint16_t, 2> joypad{};    // auto-read results, per-frame
+std::array<uint8_t, 0x20000> wram{}; // 128 KB
+    std::array<uint16_t, 2> joypad{};    // LATCHED snapshot — what $4016/4017 shift out and $4218-421B read
+    std::array<uint16_t, 2> rawJoypad{}; // live input, written by the frontend (ding_set_button etc.)
+
+    // Auto-joypad-read busy window. Real hardware takes ~4224 master
+    // clocks after vblank starts to serially read both controllers;
+    // $4212 bit0 reads busy for that whole window. We don't need to be
+    // cycle-exact about WHEN the latch happens (immediate, at vblank
+    // start, is fine) — just that bit0 reads busy for roughly the right
+    // duration for games that wait on it before trusting $4218-421B.
+    static constexpr int kAutoJoyCycles = 4224;
+    int autoJoyCountdown = 0;
+    void tickAutoJoy(int masterClocks) {
+        if (autoJoyCountdown > 0) autoJoyCountdown = std::max(0, autoJoyCountdown - masterClocks);
+    }
 
     // ── Internal CPU registers ($4200–$421F) ──────────────────────────────
     uint8_t nmitimen = 0x00; // $4200
@@ -81,8 +95,28 @@ uint8_t read(uint32_t addr24);
     uint8_t  wrmpya = 0xFF, wrmpyb = 0xFF;
     uint16_t mpyResult = 0x0000;
 
-    uint8_t  wrdivl = 0xFF, wrdivh = 0xFF, wrdivb = 0xFF;
+uint8_t  wrdivl = 0xFF, wrdivh = 0xFF, wrdivb = 0xFF;
     uint16_t divResult = 0x0000, modResult = 0x0000;
+
+    // Multiply ($4202/4203) and divide ($4204-4206) are NOT instant on real
+    // hardware — ~8 CPU cycles for multiply, ~16 for divide, before the
+    // result registers ($4214-4217) update. Reads during that window return
+    // the PREVIOUS result, not the new one. Approximated as master-clock
+    // countdowns (CPU cycles * 8 master-clocks/cycle, worst-case SlowROM).
+    static constexpr int kMulCycles = 64;  // ~8 CPU cycles
+    static constexpr int kDivCycles = 128; // ~16 CPU cycles
+    int mulDivCountdown = 0;
+    bool pendingIsDiv = false;
+    uint16_t pendingResult = 0, pendingMod = 0;
+    void tickMulDiv(int masterClocks) {
+        if (mulDivCountdown <= 0) return;
+        mulDivCountdown -= masterClocks;
+        if (mulDivCountdown <= 0) {
+            if (pendingIsDiv) { divResult = pendingResult; modResult = pendingMod; }
+            else              { mpyResult = pendingResult; }
+            mulDivCountdown = 0;
+        }
+    }
 
     uint16_t htime = 0x01FF, vtime = 0x01FF;
 

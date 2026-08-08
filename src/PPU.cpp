@@ -28,42 +28,94 @@ void PPU::reloadOamAddr() {
     oamByteAddr = (((regs[0x03] & 1) << 8) | regs[0x02]) << 1;
 }
 
+void PPU::latchHV() {
+    // clk is master cycles into the current scanline; ~4 master clocks per
+    // dot (long dots 323/327 aside — close enough for latch purposes).
+    latchedH = static_cast<uint16_t>(std::min<uint32_t>(clk / 4, 339));
+    latchedV = static_cast<uint16_t>(scanline);
+    extLatchFlag = true;
+    hvToggle[0] = false;
+    hvToggle[1] = false;
+}
+
 uint8_t PPU::regRead(uint16_t addr) {
     int r = addr - 0x2100;
     switch (r) {
-        case 0x34: { uint32_t p = (m7a * (m7b >> 8)) & 0xFFFFFF; return p & 0xFF; }
-        case 0x35: { uint32_t p = (m7a * (m7b >> 8)) & 0xFFFFFF; return (p >> 8) & 0xFF; }
-        case 0x36: { uint32_t p = (m7a * (m7b >> 8)) & 0xFFFFFF; return (p >> 16) & 0xFF; }
+case 0x34: { uint32_t p = (m7a * (m7b >> 8)) & 0xFFFFFF; ppu1OpenBus = p & 0xFF; return ppu1OpenBus; }
+        case 0x35: { uint32_t p = (m7a * (m7b >> 8)) & 0xFFFFFF; ppu1OpenBus = (p >> 8) & 0xFF; return ppu1OpenBus; }
+        case 0x36: { uint32_t p = (m7a * (m7b >> 8)) & 0xFFFFFF; ppu1OpenBus = (p >> 16) & 0xFF; return ppu1OpenBus; }
         case 0x38: {
             uint8_t v = vramRdBuf & 0xFF;
             if (!vramIncOnHi) { vramAddr = (vramAddr + vramInc) & 0x7FFF; prefetchVRAM(); }
+            ppu1OpenBus = v;
             return v;
         }
         case 0x39: {
             uint8_t v = (vramRdBuf >> 8) & 0xFF;
             if (vramIncOnHi) { vramAddr = (vramAddr + vramInc) & 0x7FFF; prefetchVRAM(); }
+            ppu1OpenBus = v;
             return v;
         }
         case 0x3B: {
             uint8_t v;
             if (!cgramLatch) { v = cgram[cgramAddr & 0xFF] & 0xFF; cgramLatch = true; }
             else { v = (cgram[cgramAddr & 0xFF] >> 8) & 0x7F; cgramAddr = (cgramAddr + 1) & 0xFF; cgramLatch = false; }
+            // '-' bit (bit7) is PPU2 open bus, not part of the CGRAM value.
+            v |= (ppu2OpenBus & 0x80);
+            ppu2OpenBus = v;
+            return v;
+        }
+        case 0x37:
+            // SLHV: read-triggered latch, gated on WRIO ($4201) bit7. The
+            // byte actually returned is open bus, not a PPU-computed value.
+            if (bus && (bus->wrio & 0x80)) latchHV();
+            return bus ? bus->openBus : 0;
+        case 0x3C: {
+            // OPHCT: 9-bit H counter (0-339), low byte then high byte (bit0
+            // only — remaining high bits are PPU2 open bus).
+            uint8_t v = hvToggle[0] ? static_cast<uint8_t>(((latchedH >> 8) & 0x01) | (ppu2OpenBus & 0xFE))
+                                     : static_cast<uint8_t>(latchedH & 0xFF);
+            hvToggle[0] = !hvToggle[0];
+            ppu2OpenBus = v;
+            return v;
+        }
+        case 0x3D: {
+            // OPVCT: 9-bit V counter, same low/high split as OPHCT.
+            uint8_t v = hvToggle[1] ? static_cast<uint8_t>(((latchedV >> 8) & 0x01) | (ppu2OpenBus & 0xFE))
+                                     : static_cast<uint8_t>(latchedV & 0xFF);
+            hvToggle[1] = !hvToggle[1];
+            ppu2OpenBus = v;
             return v;
         }
 case 0x3E:
             // bit7=time over, bit6=range over, bit5=master/slave (unused),
             // bits4-0=PPU1 open-bus/version (kept as the old hardcoded 0x01).
-            return (spriteTimeOver ? 0x80 : 0) | (spriteRangeOver ? 0x40 : 0) | 0x01;
+            {
+                uint8_t v = (spriteTimeOver ? 0x80 : 0) | (spriteRangeOver ? 0x40 : 0) |
+                            (ppu1OpenBus & 0x20) | 0x01;
+                ppu1OpenBus = v;
+                return v;
+            }
         case 0x3F: {
             // STAT78: bit7=interlace field (unused, always 0 - no interlace),
-            // bit5=PAL/NTSC (0=NTSC, hardcoded until region switching exists),
-            // bit4=ppu1/2 version marker, bits3-0=CPU version.
-            // Real hardware also resets the Mode 7 h/v-counter latch on this
-            // read; we don't latch counters yet so nothing to clear here.
-            return 0x02;
+            // bit6=external latch flag (set by latchHV(), cleared here but
+            // only when WRIO bit7 is set), bit5=PAL/NTSC (0=NTSC, hardcoded
+            // until region switching exists), bit4=ppu version marker,
+            // bits3-0=CPU version.
+            uint8_t v = (extLatchFlag ? 0x40 : 0) | 0x02;
+            hvToggle[0] = false;
+            hvToggle[1] = false;
+            if (bus && (bus->wrio & 0x80)) extLatchFlag = false;
+            ppu2OpenBus = v;
+            return v;
         }
         default:
-            return (r >= 0 && r < static_cast<int>(regs.size())) ? regs[r] : 0;
+            // Write-only registers (e.g. $21x4-6/$21x8-A) return the owning
+            // chip's MDR on read, not the stored byte. We don't track exactly
+            // which write-only register belongs to which chip, so PPU1's MDR
+            // is used as the best-effort default — it's the far more common
+            // case (most write-only regs sit in PPU1's territory).
+            return ppu1OpenBus;
     }
 }
 

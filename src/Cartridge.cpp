@@ -136,10 +136,18 @@ uint8_t Cartridge::read(uint8_t bank, uint16_t addr) const {
         uint32_t off = ((b & 0x7F) * 0x8000u) + (a - 0x8000);
         return rom[off % rom.size()];
     }
-    if (!sram.empty() && ((b >= 0x70 && b <= 0x7D) || b >= 0xF0)) {
+if (!sram.empty() && ((b >= 0x70 && b <= 0x7D) || b >= 0xF0)) {
         int bankBase = b >= 0xF0 ? b - 0xF0 : b - 0x70;
         uint32_t off = (bankBase * 0x8000u) + a;
         return sram[off % sram.size()];
+    }
+    // Secondary SRAM mirror at $20-3F/$A0-BF:6000-7FFF — several boards
+    // don't fully decode bank bits, so genuine hardware exposes the same
+    // SRAM here too. DKC 1-3's anti-piracy self-check writes/reads exactly
+    // this range to confirm real SRAM mirroring vs. a copier's flat mapping.
+    if (!sram.empty() && a >= 0x6000 && a <= 0x7FFF &&
+        ((b >= 0x20 && b <= 0x3F) || (b >= 0xA0 && b <= 0xBF))) {
+        return sram[(a - 0x6000) % sram.size()];
     }
     return 0;
 }
@@ -149,16 +157,26 @@ void Cartridge::write(uint8_t bank, uint16_t addr, uint8_t val) {
     uint16_t a = addr;
     if (sram.empty()) return;
 
-    if (hiROM || exHiROM) {
+if (hiROM || exHiROM) {
         if (a >= 0x6000 && a <= 0x7FFF) {
             uint32_t off = ((b & 0x1F) * 0x2000u) + (a - 0x6000);
-            if (off < sram.size()) sram[off] = val;
+            sram[off % sram.size()] = val;
         }
     } else {
         if ((b >= 0x70 && b <= 0x7D) || b >= 0xF0) {
             int bankBase = b >= 0xF0 ? b - 0xF0 : b - 0x70;
             uint32_t off = (bankBase * 0x8000u) + a;
-            if (off < sram.size()) sram[off] = val;
+            // Wrap, don't drop: real SRAM chips only have as many address
+            // lines as their actual size, so writes past that alias back
+            // onto the same physical cells. Super Metroid's SRAM mapping
+            // check exploits exactly this — it writes an incrementing
+            // pattern above the chip's nominal window (e.g. $702000+ for
+            // an 8KB chip) and expects it to mirror into $700000+. The old
+            // bounds-reject silently dropped those writes instead.
+            sram[off % sram.size()] = val;
+        } else if (a >= 0x6000 && a <= 0x7FFF &&
+                   ((b >= 0x20 && b <= 0x3F) || (b >= 0xA0 && b <= 0xBF))) {
+            sram[(a - 0x6000) % sram.size()] = val;
         }
     }
 }

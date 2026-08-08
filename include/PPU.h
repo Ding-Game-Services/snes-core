@@ -44,9 +44,26 @@ uint8_t regRead(uint16_t addr);
     bool     vramIncOnHi = false;
     uint16_t vramRdBuf = 0;
 
-    uint8_t cgramAddr = 0;
+uint8_t cgramAddr = 0;
     uint8_t cgramBuf = 0;
     bool    cgramLatch = false;
+
+    // ── H/V counter latch ($2137 SLHV, $213C OPHCT, $213D OPVCT) ──────────
+    // Real hardware latches on: reading $2137 while $4201 bit7 is set, or a
+    // 1->0 transition of $4201 bit7 itself (Bus.cpp's job to call this).
+    // Public so Bus can trigger it too.
+    void latchHV();
+    uint16_t latchedH = 0, latchedV = 0;      // 9-bit each
+    bool     hvToggle[2] = { false, false };  // [0]=OPHCT, [1]=OPVCT low/high selector
+    bool     extLatchFlag = false;            // STAT78 bit6, cleared on $213F read (gated by $4201 bit7)
+
+    // ── PPU1/PPU2 open bus (MDR) ───────────────────────────────────────────
+    // Each PPU chip has its own memory data register, separate from the
+    // CPU's open bus in Bus.cpp. PPU1's MDR updates on reads of $2134-6,
+    // $2138-A, or $213E; PPU2's on reads of $213B-D or $213F. Reading any
+    // OTHER (write-only) register in this space returns the owning chip's
+    // MDR value, not the last-written byte — see wiki.superfamicom.org/open-bus.
+    uint8_t ppu1OpenBus = 0, ppu2OpenBus = 0;
 
 uint16_t oamByteAddr = 0;
     uint8_t  oamLow = 0;

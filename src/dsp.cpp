@@ -289,15 +289,27 @@ void DSP::tickEcho(int32_t inL, int32_t inR, int32_t& outL, int32_t& outR) {
     echoHistL[echoHistPos] = readL;
     echoHistR[echoHistPos] = readR;
 
-    int32_t firL = 0, firR = 0;
-    for (int k = 0; k < 8; k++) {
+// Real hardware accumulates the FIR sum in a 16-bit register: the first
+    // 7 taps wrap/overflow (clip) individually, and only the 8th (final)
+    // addition saturates (clamp). A single full-precision sum clamped once
+    // at the end (the old behavior) produces clean saturation instead of
+    // the characteristic click real hardware makes when FIR gain exceeds
+    // unity (coefficient sum > 128) — audible on games that lean on it.
+    int32_t accL = 0, accR = 0;
+    for (int k = 0; k < 7; k++) {
         int8_t coef = static_cast<int8_t>(regs[0x0F + k * 0x10]);
         int idx = (echoHistPos - k) & 7;
-        firL += static_cast<int32_t>(echoHistL[idx]) * coef;
-        firR += static_cast<int32_t>(echoHistR[idx]) * coef;
+        accL = static_cast<int16_t>(accL + static_cast<int32_t>(echoHistL[idx]) * coef / 128);
+        accR = static_cast<int16_t>(accR + static_cast<int32_t>(echoHistR[idx]) * coef / 128);
     }
-int16_t filtL = clamp16(firL >> 7);
-    int16_t filtR = clamp16(firR >> 7);
+    {
+        int8_t coef7 = static_cast<int8_t>(regs[0x0F + 7 * 0x10]);
+        int idx7 = (echoHistPos - 7) & 7;
+        accL += static_cast<int32_t>(echoHistL[idx7]) * coef7 / 128;
+        accR += static_cast<int32_t>(echoHistR[idx7]) * coef7 / 128;
+    }
+    int16_t filtL = clamp16(accL);
+    int16_t filtR = clamp16(accR);
 
     // Output: echo volume scales the FIR-filtered sample.
     int8_t evolL = static_cast<int8_t>(regs[kEVOLL]);

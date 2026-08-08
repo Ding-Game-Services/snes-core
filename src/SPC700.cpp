@@ -32,7 +32,7 @@ void SPC700::wr(uint16_t addr, uint8_t val) {
 
 uint8_t SPC700::ioRead(uint16_t addr) {
     switch (addr) {
-        case 0x00F2: return dspAddr;
+        case 0x00F2: return dspAddr & 0x7F;
         case 0x00F3: return dspRegs[dspAddr & 0x7F];
         case 0x00F4: return inPorts[0];
         case 0x00F5: return inPorts[1];
@@ -50,14 +50,17 @@ uint8_t SPC700::ioRead(uint16_t addr) {
 void SPC700::ioWrite(uint16_t addr, uint8_t val) {
     switch (addr) {
 case 0x00F1:
-    ctrlReg = val;
     for (int i = 0; i < 3; i++) {
+        bool wasEn = timerEn[i];
         timerEn[i] = val & (1 << i);
-        // Writing '1' to a timer bit (re)starts that timer even if it
-        // was already running — real hardware always resets on this,
-        // not just on an off->on transition.
-        if (timerEn[i]) { timerDiv[i] = 0; timerOut[i] = 0; timerCycles[i] = 0; }
+        // Only an actual 0->1 transition resets the counter/output — a
+        // write that re-asserts an already-set bit (common when a driver
+        // touches CONTROL for an unrelated reason, e.g. the port-clear
+        // bits) must NOT restart timers that are already running, or
+        // their phase desyncs from whatever they're driving.
+        if (timerEn[i] && !wasEn) { timerDiv[i] = 0; timerOut[i] = 0; timerCycles[i] = 0; }
     }
+    ctrlReg = val;
     if (val & 0x10) { inPorts[0] = 0; inPorts[1] = 0; }
     if (val & 0x20) { inPorts[2] = 0; inPorts[3] = 0; }
     break;
@@ -218,7 +221,7 @@ int SPC700::step() {
         case 0x8F: { uint8_t imm = rd(PC++); uint16_t dst = dp(); wr(dst, imm); cy = 5; break; }
         case 0xFA: { uint16_t src = dp(), dst = dp(); wr(dst, rd(src)); cy = 5; break; }
         case 0xBA: { uint16_t a = dp(); A = rd(a); Y = rd((a + 1) & 0xFFFF); sNZ16((Y << 8) | A); cy = 5; break; }
-        case 0xDA: { uint16_t a = dp(); wr(a, A); wr((a + 1) & 0xFFFF, Y); cy = 5; break; }
+        case 0xDA: { uint16_t a = dp(); wr(a, A); wr((a + 1) & 0xFFFF, Y); cy = 4; break; }
         case 0x1A: {
             uint16_t a = dp();
             uint16_t v = (static_cast<uint16_t>(rd((a+1)&0xFFFF)) << 8 | rd(a));
@@ -459,9 +462,9 @@ case 0x6E: {
         case 0xCA: { uint16_t ab = abs_(); int b = ab & 7; uint16_t a = ab >> 3; wr(a, C ? (rd(a) | (1 << b)) : (rd(a) & ~(1 << b))); cy = 6; break; }
 case 0x6A: { uint16_t ab = abs_(); C = C & (1 ^ ((rd(ab >> 3) >> (ab & 7)) & 1)); cy = 4; break; }
         case 0x4A: { uint16_t ab = abs_(); C = C & ((rd(ab >> 3) >> (ab & 7)) & 1); cy = 4; break; }
-        case 0x0A: { uint16_t ab = abs_(); C = C | ((rd(ab >> 3) >> (ab & 7)) & 1); cy = 4; break; }
-        case 0x2A: { uint16_t ab = abs_(); C = C | (1 ^ ((rd(ab >> 3) >> (ab & 7)) & 1)); cy = 4; break; }
-        case 0x8A: { uint16_t ab = abs_(); C = C ^ ((rd(ab >> 3) >> (ab & 7)) & 1); cy = 4; break; }
+case 0x0A: { uint16_t ab = abs_(); C = C | ((rd(ab >> 3) >> (ab & 7)) & 1); cy = 5; break; }
+case 0x2A: { uint16_t ab = abs_(); C = C | (1 ^ ((rd(ab >> 3) >> (ab & 7)) & 1)); cy = 5; break; }
+case 0x8A: { uint16_t ab = abs_(); C = C ^ ((rd(ab >> 3) >> (ab & 7)) & 1); cy = 5; break; }
         case 0xEA: { uint16_t ab = abs_(); int b = ab & 7; uint16_t a = ab >> 3; wr(a, rd(a) ^ (1 << b)); cy = 5; break; }
 case 0x0E: { uint16_t a = abs_(); uint8_t v = rd(a); sNZ(A & v); wr(a, v | A); cy = 6; break; }
 case 0x4E: { uint16_t a = abs_(); uint8_t v = rd(a); sNZ(A & v); wr(a, v & ~A); cy = 6; break; }
@@ -471,8 +474,8 @@ case 0x4E: { uint16_t a = abs_(); uint8_t v = rd(a); sNZ(A & v); wr(a, v & ~A); 
         case 0xE0: V = 0; H = 0; cy = 2; break;
         case 0x20: P = 0; cy = 2; break;
         case 0x40: P = 1; cy = 2; break;
-        case 0xA0: I = 1; cy = 2; break;
-        case 0xC0: I = 0; cy = 2; break;
+        case 0xA0: I = 1; cy = 3; break;
+case 0xC0: I = 0; cy = 3; break;
         case 0x00: cy = 2; break;
 		case 0x0F: {
             push((PC >> 8) & 0xFF); push(PC & 0xFF); push(getP());
@@ -480,7 +483,7 @@ case 0x4E: { uint16_t a = abs_(); uint8_t v = rd(a); sNZ(A & v); wr(a, v & ~A); 
             PC = (rd(0xFFDF) << 8) | rd(0xFFDE);
             cy = 8; break;
         }
-        case 0xFF: cy = 3; break;
+        case 0xFF: cy = 2; break;
         case 0xEF: cy = 3; break;
         default:   cy = 2; break;
     }

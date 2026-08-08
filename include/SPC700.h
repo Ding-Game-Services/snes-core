@@ -21,7 +21,7 @@ public:
     std::array<uint8_t, 0x10000> ram{};
 
     uint8_t  A = 0, X = 0, Y = 0;
-    uint8_t  SP = 0xFF;
+    uint8_t  SP = 0xEF; // documented IPL reset state (snes.nesdev.org/wiki/S-SMP)
     uint16_t PC = 0xFFC0;
 
     // Flags: Negative, oVerflow, zero-Page, Break, Half-carry, Interrupt, Zero, Carry
